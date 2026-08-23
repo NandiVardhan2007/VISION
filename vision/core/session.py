@@ -1,11 +1,20 @@
 """
-Session and state tracking for VISION user interactions across channels.
+Persistent session and conversation history tracking for VISION.
+Stores and loads all past user/assistant conversations in `data/conversations.json`
+so conversations persist permanently across app reboots.
 """
 
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field
+from pathlib import Path
+from datetime import datetime
+import json
 import time
 import uuid
+from vision.logger import logger
+
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+CONVERSATIONS_FILE = DATA_DIR / "conversations.json"
 
 
 @dataclass
@@ -16,6 +25,39 @@ class Message:
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
+    label: Optional[str] = None
+    time_str: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "role": self.role,
+            "content": self.content,
+            "timestamp": self.timestamp
+        }
+        if self.name:
+            d["name"] = self.name
+        if self.tool_calls:
+            d["tool_calls"] = self.tool_calls
+        if self.tool_call_id:
+            d["tool_call_id"] = self.tool_call_id
+        if self.label:
+            d["label"] = self.label
+        if self.time_str:
+            d["time"] = self.time_str
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Message":
+        return cls(
+            role=data.get("role", "user"),
+            content=data.get("content"),
+            name=data.get("name"),
+            tool_calls=data.get("tool_calls"),
+            tool_call_id=data.get("tool_call_id"),
+            timestamp=data.get("timestamp", time.time()),
+            label=data.get("label"),
+            time_str=data.get("time")
+        )
 
 
 @dataclass
@@ -32,9 +74,11 @@ class Session:
         msg = Message(role=role, content=content, **kwargs)
         self.messages.append(msg)
         self.last_active_at = time.time()
+        session_manager.save_to_disk()
         return msg
 
-    def get_messages_for_llm(self, max_history: int = 20) -> List[Dict[str, Any]]:
+    def get_messages_for_llm(self, max_history: int = 25) -> List[Dict[str, Any]]:
+        # Retrieve recent non-tool or tool-paired context for LLM
         recent = self.messages[-max_history:]
         formatted = []
         for m in recent:
@@ -53,14 +97,88 @@ class Session:
     def clear(self):
         self.messages.clear()
         self.last_active_at = time.time()
+        session_manager.save_to_disk()
+
+
+def _parse_timestamp(ts_str: Any) -> float:
+    if not ts_str or not isinstance(ts_str, str):
+        return time.time()
+    try:
+        cleaned = ts_str.strip().replace("Z", "+00:00")
+        return datetime.fromisoformat(cleaned).timestamp()
+    except Exception:
+        return time.time()
 
 
 class SessionManager:
     def __init__(self):
         self._sessions: Dict[str, Session] = {}
+        self._transcripts: List[Dict[str, Any]] = []
+        self._ensure_dir()
+        self.load_from_disk()
+
+    def _ensure_dir(self):
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.error(f"[SessionManager] Error creating data directory: {e}")
+
+    def load_from_disk(self):
+        """Loads persistent conversations from data/conversations.json."""
+        if not CONVERSATIONS_FILE.exists():
+            logger.info("[SessionManager] No previous conversations.json found. Starting fresh.")
+            return
+
+        try:
+            with open(CONVERSATIONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            raw_transcripts = data.get("conversations", [])
+            self._transcripts = raw_transcripts
+
+            # Populate primary sessions so LLM immediately has past conversation turns in working memory
+            target_session_ids = ["vision_hud_session", "web_session", "default_session"]
+            for s_id in target_session_ids:
+                s = self.get_or_create(s_id)
+                s.messages.clear()
+
+                for item in raw_transcripts:
+                    speaker = item.get("speaker", "user")
+                    role = "assistant" if speaker == "ai" else "user"
+                    text = item.get("text", "")
+                    if text:
+                        msg = Message(
+                            role=role,
+                            content=text,
+                            label=item.get("label"),
+                            time_str=item.get("time"),
+                            timestamp=_parse_timestamp(item.get("timestamp"))
+                        )
+                        s.messages.append(msg)
+
+            logger.info(f"[SessionManager] Loaded {len(self._transcripts)} persistent conversation messages from {CONVERSATIONS_FILE}")
+        except Exception as e:
+            logger.warning(f"[SessionManager] Error loading conversations.json: {e}")
+
+    def save_to_disk(self):
+        """Atomically saves all conversation history to data/conversations.json."""
+        try:
+            self._ensure_dir()
+            payload = {
+                "last_updated": datetime.now().isoformat(),
+                "total_conversations": len(self._transcripts),
+                "conversations": self._transcripts
+            }
+            tmp_file = CONVERSATIONS_FILE.with_suffix(".tmp")
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            tmp_file.replace(CONVERSATIONS_FILE)
+            logger.debug(f"[SessionManager] Persisted {len(self._transcripts)} messages to {CONVERSATIONS_FILE}")
+        except Exception as e:
+            logger.error(f"[SessionManager] Error saving conversations.json: {e}")
 
     def get_or_create(self, session_id: Optional[str] = None, channel: str = "web", user_id: str = "default_user") -> Session:
-        s_id = session_id or str(uuid.uuid4())
+        s_id = session_id or "vision_hud_session"
         if s_id not in self._sessions:
             self._sessions[s_id] = Session(session_id=s_id, channel=channel, user_id=user_id)
         return self._sessions[s_id]
@@ -68,8 +186,36 @@ class SessionManager:
     def get(self, session_id: str) -> Optional[Session]:
         return self._sessions.get(session_id)
 
-    def delete(self, session_id: str):
-        self._sessions.pop(session_id, None)
+    def get_all_transcripts(self) -> List[Dict[str, Any]]:
+        """Returns the full list of transcripts for the frontend/API."""
+        return list(self._transcripts)
+
+    def append_transcript(self, speaker: str, label: str, text: str, time_str: Optional[str] = None, timestamp: Optional[str] = None):
+        """Appends a new conversation entry and persists it to conversations.json."""
+        now = datetime.now()
+        entry = {
+            "index": len(self._transcripts) + 1,
+            "speaker": speaker,
+            "label": label,
+            "text": text,
+            "time": time_str or now.strftime("%I:%M:%S %p"),
+            "timestamp": timestamp or now.isoformat()
+        }
+        self._transcripts.append(entry)
+        self.save_to_disk()
+        return entry
+
+    def set_all_transcripts(self, transcripts: List[Dict[str, Any]]):
+        """Overwrites transcript list with validated list and persists."""
+        self._transcripts = transcripts
+        self.save_to_disk()
+
+    def clear_all(self):
+        """Clears all conversation history."""
+        self._transcripts = []
+        for s in self._sessions.values():
+            s.messages.clear()
+        self.save_to_disk()
 
 
 # Global session manager singleton

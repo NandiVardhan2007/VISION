@@ -5,8 +5,11 @@ Uses active gemini-1.5-flash model.
 
 from typing import List, Dict, Any, AsyncGenerator, Optional
 import time
+import warnings
 from vision.cognitive.providers.base import BaseLLMProvider
 from vision.logger import logger
+
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*google.generativeai.*")
 
 try:
     import google.generativeai as genai

@@ -60,7 +60,7 @@ const VisionChat = (() => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: text,
-          session_id: 'web_session',
+          session_id: 'vision_hud_session',
           synthesize_voice: false
         })
       });

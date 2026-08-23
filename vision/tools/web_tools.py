@@ -4,9 +4,12 @@ Supports real-time DuckDuckGo web search, webpage text extraction, and live weat
 """
 
 import re
+import warnings
 from typing import Optional, List, Dict, Any
 from vision.tools.registry import tool
 from vision.logger import logger
+
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*duckduckgo_search.*")
 
 try:
     from ddgs import DDGS

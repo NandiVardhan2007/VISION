@@ -172,8 +172,9 @@ const VisionVoice = (() => {
       return;
     }
 
-    if (VisionOrb.getState() === 'speaking' || speechTimeout) {
+    if (VisionOrb.getState() === 'speaking' || speechTimeout || (typeof VisionTranscript !== 'undefined' && VisionTranscript.isLiveStreaming())) {
       if (speechTimeout) { clearTimeout(speechTimeout); speechTimeout = null; }
+      if (typeof VisionTranscript !== 'undefined') VisionTranscript.cancelLiveTranscript();
       fetch(`${API_BASE}/api/audio/stop`, { method: 'POST' }).catch(() => {});
     }
 
@@ -213,6 +214,9 @@ const VisionVoice = (() => {
       if (muteBtn) muteBtn.classList.remove('active-hud');
       if (muteIconContainer) muteIconContainer.innerHTML = `<i data-lucide="mic-off" class="icon-sm"></i>`;
       if (muteLabel) muteLabel.textContent = 'MUTED: ON';
+
+      if (typeof VisionTranscript !== 'undefined') VisionTranscript.cancelLiveTranscript();
+      fetch(`${API_BASE}/api/audio/stop`, { method: 'POST' }).catch(() => {});
 
       if (micStream) micStream.getAudioTracks().forEach(track => track.enabled = false);
       if (mediaRecorder && mediaRecorder.state === 'recording') { try { mediaRecorder.stop(); } catch(e){} }
@@ -337,25 +341,31 @@ const VisionVoice = (() => {
       const rms = Math.sqrt(sum / buffer.length);
       const now = Date.now();
 
-      if (!isUserSpeaking && VisionOrb.getState() !== 'speaking') {
+      if (!isUserSpeaking && VisionOrb.getState() !== 'speaking' && !isProcessing) {
         ambientNoiseFloor = ambientNoiseFloor * 0.96 + rms * 0.04;
       }
 
-      const isAgentSpeaking = (VisionOrb.getState() === 'speaking' || speechTimeout !== null);
-      const dynamicThreshold = isAgentSpeaking ? 0.055 : Math.max(0.038, Math.min(0.09, ambientNoiseFloor * 3.2));
+      // Check if VISION is currently thinking, executing, or speaking
+      const isAgentActive = (VisionOrb.getState() === 'speaking' || VisionOrb.getState() === 'thinking' || VisionOrb.getState() === 'executing' || speechTimeout !== null || isProcessing);
+
+      // When VISION is speaking or generating, use a high threshold and more frames to prevent speaker bleed from triggering VAD
+      const dynamicThreshold = isAgentActive ? Math.max(0.18, ambientNoiseFloor * 7.0) : Math.max(0.038, Math.min(0.09, ambientNoiseFloor * 3.2));
+      const requiredFrames = isAgentActive ? 8 : REQUIRED_SPEECH_FRAMES; // Require 320ms of deliberate loud speech to interrupt
 
       if (rms > dynamicThreshold) {
         consecutiveSpeechFrames++;
         lastSpeechTime = now;
 
-        if (isAgentSpeaking) {
+        // Intentional Barge-in: only if user deliberately speaks loudly over VISION for 8+ frames
+        if (isAgentActive && consecutiveSpeechFrames >= requiredFrames) {
           if (speechTimeout) { clearTimeout(speechTimeout); speechTimeout = null; }
+          if (typeof VisionTranscript !== 'undefined') VisionTranscript.cancelLiveTranscript();
           fetch(`${API_BASE}/api/audio/stop`, { method: 'POST' }).catch(() => {});
           isProcessing = false;
           setAgentState('listening');
         }
 
-        if (consecutiveSpeechFrames >= REQUIRED_SPEECH_FRAMES && !isUserSpeaking) {
+        if (consecutiveSpeechFrames >= requiredFrames && !isUserSpeaking) {
           isProcessing = false;
           isUserSpeaking = true;
           speechStartTime = now;
@@ -442,8 +452,9 @@ const VisionVoice = (() => {
     if (!text) return;
     cmdInput.value = '';
 
-    if (VisionOrb.getState() === 'speaking' || speechTimeout) {
+    if (VisionOrb.getState() === 'speaking' || speechTimeout || (typeof VisionTranscript !== 'undefined' && VisionTranscript.isLiveStreaming())) {
       if (speechTimeout) { clearTimeout(speechTimeout); speechTimeout = null; }
+      if (typeof VisionTranscript !== 'undefined') VisionTranscript.cancelLiveTranscript();
       fetch(`${API_BASE}/api/audio/stop`, { method: 'POST' }).catch(() => {});
     }
 
@@ -461,29 +472,37 @@ const VisionVoice = (() => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: userMessage,
-          session_id: 'handsfree_session',
+          session_id: 'vision_hud_session',
           synthesize_voice: true
         })
       });
 
       const data = await res.json();
       const responseText = data.response || data.detail || 'Action completed.';
+
+      // Unblock processing immediately so new microphone speech can be detected
+      isProcessing = false;
       setAgentState('speaking');
-      VisionTranscript.logTranscript('ai', 'VISION', responseText);
 
-      const estimatedSpeechDuration = Math.max(3000, Math.min(14000, responseText.length * 45));
-
-      if (speechTimeout) clearTimeout(speechTimeout);
-      speechTimeout = setTimeout(() => {
-        isProcessing = false;
-        speechTimeout = null;
-        if (VisionOrb.getState() === 'speaking') {
-          setAgentState(isMuted ? 'muted' : 'idle');
+      // Live word-by-word streaming synchronization with spoken voice
+      VisionTranscript.streamSpokenText(responseText, {
+        onWord: () => {
+          if (VisionOrb.getState() !== 'speaking' && !isMuted && !isUserSpeaking) {
+            setAgentState('speaking');
+          }
+        },
+        onComplete: () => {
+          if (VisionOrb.getState() === 'speaking' && !isUserSpeaking) {
+            setAgentState(isMuted ? 'muted' : 'idle');
+          }
         }
-      }, estimatedSpeechDuration);
+      });
 
     } catch (err) {
-      VisionTranscript.logTranscript('ai', 'VISION', `⚠️ Request failed: ${err.message}. Ensure VISION server is running.`);
+      if (typeof VisionTranscript !== 'undefined') {
+        VisionTranscript.cancelLiveTranscript();
+        VisionTranscript.logTranscript('ai', 'VISION', `⚠️ Request failed: ${err.message}. Ensure VISION server is running.`);
+      }
       setAgentState(isMuted ? 'muted' : 'idle');
       isProcessing = false;
     }

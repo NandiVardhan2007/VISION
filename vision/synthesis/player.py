@@ -70,6 +70,23 @@ class AudioPlayer:
             if interruptible and self._interrupted.is_set():
                 return False
 
+            # Apply 4ms linear micro-fade at boundaries to eliminate zero-crossing DAC pops/clicks
+            try:
+                import numpy as np
+                fade_samples = min(int(fs * 0.004), len(data) // 4)
+                if fade_samples > 0:
+                    data = data.copy()
+                    fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
+                    fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+                    if data.ndim == 1:
+                        data[:fade_samples] *= fade_in
+                        data[-fade_samples:] *= fade_out
+                    else:
+                        data[:fade_samples, :] *= fade_in[:, None]
+                        data[-fade_samples:, :] *= fade_out[:, None]
+            except Exception:
+                pass
+
             # Use OutputStream or sd.play with polling for instant barge-in detection
             sd.play(data, fs)
             

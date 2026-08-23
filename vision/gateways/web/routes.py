@@ -3,13 +3,16 @@ FastAPI REST routes for VISION web dashboard and API access.
 """
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
+import asyncio
+import json
 import time
 import os
 import psutil
 from datetime import datetime
+from pathlib import Path
 
 from vision.core.engine import vision_engine
 from vision.perception.stt import smart_stt
@@ -20,6 +23,7 @@ from vision.cognitive.load_balancer import load_balancer
 from vision.memory.mag_engine import mag_engine
 from vision.memory.cag_engine import cag_engine
 from vision.memory.working_memory import working_memory
+from vision.core.session import session_manager
 from vision.logger import logger
 
 router = APIRouter()
@@ -51,6 +55,13 @@ class ForgetRequest(BaseModel):
 
 class SynthesizeRequest(BaseModel):
     text: str
+
+
+class SaveSessionRequest(BaseModel):
+    session_id: str
+    transcripts: List[Dict[str, Any]]
+    total_messages: Optional[int] = 0
+    exported_at: Optional[str] = None
 
 
 @router.get("/health")
@@ -205,6 +216,66 @@ async def chat(req: ChatRequest):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    Server-Sent Events (SSE) streaming endpoint for real-time word-by-word transcription.
+    Streams tokens in real-time as they are generated and spoken by VISION.
+    """
+    async def event_generator():
+        token_queue: asyncio.Queue = asyncio.Queue()
+        session_id = req.session_id or "web_stream_session"
+
+        async def _token_cb(token: str):
+            await token_queue.put({"type": "token", "token": token})
+
+        async def _run_engine():
+            try:
+                res = await vision_engine.process_user_input(
+                    user_text=req.message,
+                    session_id=session_id,
+                    channel="web_stream",
+                    synthesize_voice=req.synthesize_voice if req.synthesize_voice is not None else True,
+                    token_callback=_token_cb
+                )
+                await token_queue.put({
+                    "type": "done",
+                    "response": res.get("response", ""),
+                    "provider": res.get("provider", ""),
+                    "latency_ms": res.get("latency_ms", 0)
+                })
+            except Exception as ex:
+                await token_queue.put({"type": "error", "detail": str(ex)})
+            finally:
+                await token_queue.put(None)
+
+        engine_task = asyncio.create_task(_run_engine())
+
+        yield f"data: {json.dumps({'type': 'start', 'session_id': session_id})}\n\n"
+
+        try:
+            while True:
+                item = await token_queue.get()
+                if item is None:
+                    break
+                yield f"data: {json.dumps(item)}\n\n"
+                if item.get("type") in ("done", "error"):
+                    break
+        finally:
+            if not engine_task.done():
+                await engine_task
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 @router.get("/tools")
@@ -389,5 +460,113 @@ async def open_excel_tracker():
     except Exception as e:
         logger.error(f"[API] Excel open error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Session Chat History & JSON Storage Endpoints ──
+SESSIONS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "sessions"
+SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@router.post("/sessions/save")
+async def save_session_transcript(req: SaveSessionRequest):
+    """Save/archive a session chat transcript as a JSON file."""
+    try:
+        # Sanitize session_id for filename
+        clean_id = "".join(c for c in req.session_id if c.isalnum() or c in ("-", "_")).strip() or "session_unnamed"
+        filename = f"{clean_id}.json"
+        filepath = SESSIONS_DIR / filename
+        data = {
+            "session_id": req.session_id,
+            "exported_at": req.exported_at or datetime.now().isoformat(),
+            "total_messages": len(req.transcripts),
+            "transcripts": req.transcripts
+        }
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.info(f"[Sessions] Saved session '{req.session_id}' ({len(req.transcripts)} messages) to {filepath}")
+        return {"status": "success", "session_id": req.session_id, "filepath": str(filepath)}
+    except Exception as e:
+        logger.error(f"[Sessions] Error saving session: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save session transcript: {e}")
+
+
+@router.get("/sessions/list")
+async def list_saved_sessions():
+    """List all archived session JSON files."""
+    try:
+        sessions = []
+        for file in sorted(SESSIONS_DIR.glob("*.json"), key=os.path.getmtime, reverse=True):
+            try:
+                with open(file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    sessions.append({
+                        "session_id": data.get("session_id", file.stem),
+                        "exported_at": data.get("exported_at", ""),
+                        "total_messages": data.get("total_messages", len(data.get("transcripts", []))),
+                        "filename": file.name
+                    })
+            except Exception:
+                pass
+        return {"sessions": sessions}
+    except Exception as e:
+        logger.error(f"[Sessions] Error listing sessions: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list session transcripts: {e}")
+
+
+@router.get("/sessions/{session_id}")
+async def get_session_transcript(session_id: str):
+    """Retrieve full JSON for a specific session."""
+    clean_id = "".join(c for c in session_id if c.isalnum() or c in ("-", "_")).strip()
+    filepath = SESSIONS_DIR / f"{clean_id}.json"
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail=f"Session transcript '{session_id}' not found.")
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read session: {e}")
+
+
+# ── Codebase-wide Permanent Conversations Storage (data/conversations.json) ──
+
+class SyncConversationsRequest(BaseModel):
+    conversations: List[Dict[str, Any]]
+
+
+@router.get("/conversations")
+async def get_all_conversations():
+    """Retrieve all persistent conversation history from data/conversations.json."""
+    return {
+        "status": "success",
+        "total_conversations": len(session_manager.get_all_transcripts()),
+        "conversations": session_manager.get_all_transcripts()
+    }
+
+
+@router.post("/conversations/sync")
+async def sync_all_conversations(req: SyncConversationsRequest):
+    """Sync frontend transcripts with backend permanent conversations.json."""
+    try:
+        session_manager.set_all_transcripts(req.conversations)
+        return {
+            "status": "success",
+            "total_conversations": len(req.conversations)
+        }
+    except Exception as e:
+        logger.error(f"[Conversations] Sync error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/conversations/clear")
+async def clear_all_conversations():
+    """Clear all stored conversations."""
+    try:
+        session_manager.clear_all()
+        return {"status": "success", "message": "All conversation history cleared."}
+    except Exception as e:
+        logger.error(f"[Conversations] Clear error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 

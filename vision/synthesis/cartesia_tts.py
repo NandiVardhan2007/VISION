@@ -1,6 +1,8 @@
 """
-Cartesia Neural TTS Provider for ultra-low latency hyper-realistic voice synthesis.
-Fully powers VISION voice output with Sonic-2 streaming architecture and multi-key failover.
+Cartesia Neural TTS Provider with Microsoft Neural TTS Fallback.
+Ultra-low latency hyper-realistic voice synthesis with zero-downtime multi-tier failover:
+- Tier 1: Cartesia Sonic-2 Neural Voice (sub-150ms TTFT, expressive prosody)
+- Tier 2: Microsoft Edge Neural TTS (unlimited credits, 100% uptime fallback)
 """
 
 import asyncio
@@ -10,15 +12,15 @@ from vision.synthesis.base import BaseTTS
 from vision.config import config
 from vision.logger import logger
 
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
+
 
 class CartesiaTTS(BaseTTS):
     """
-    Direct ultra-low latency Cartesia Neural TTS Engine.
-    Features:
-    - Sonic-2 Neural Voice model with sub-150ms TTFT
-    - Automated API key rotation across key pool on quota/rate-limits
-    - Emotion and speed modulation
-    - Direct PCM WAV stream synthesis
+    Direct ultra-low latency Cartesia Neural TTS Engine with automatic Edge-TTS fallback.
     """
 
     def __init__(
@@ -42,8 +44,16 @@ class CartesiaTTS(BaseTTS):
             return config.CARTESIA_API_KEY
         return self.api_keys[self.current_key_index % len(self.api_keys)]
 
-    def _rotate_api_key(self):
-        if len(self.api_keys) > 1:
+    def _rotate_api_key(self, permanent_failure: bool = False):
+        if not self.api_keys:
+            return
+        if permanent_failure and len(self.api_keys) > 1:
+            idx = self.current_key_index % len(self.api_keys)
+            bad_key = self.api_keys.pop(idx)
+            logger.warning(f"[CartesiaTTS] Permanently removed exhausted API key ...{bad_key[-6:]} ({len(self.api_keys)} key(s) remaining)")
+            if self.current_key_index >= len(self.api_keys):
+                self.current_key_index = 0
+        elif len(self.api_keys) > 1:
             self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
             logger.info(f"[CartesiaTTS] Rotated to API Key index {self.current_key_index + 1}/{len(self.api_keys)}")
 
@@ -55,8 +65,27 @@ class CartesiaTTS(BaseTTS):
             )
         return self._client
 
+    async def _synthesize_edge_fallback(self, text: str) -> bytes:
+        """Fallback synthesis using Microsoft Edge Neural TTS."""
+        if not edge_tts:
+            logger.error("[CartesiaTTS] edge_tts package not available for fallback.")
+            return b""
+        try:
+            voice = getattr(config, "EDGE_TTS_VOICE", "en-US-GuyNeural")
+            communicate = edge_tts.Communicate(text, voice)
+            audio_chunks = []
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_chunks.append(chunk["data"])
+            audio_bytes = b"".join(audio_chunks)
+            logger.info(f"[CartesiaTTS] Fallback to EdgeTTS synthesized {len(audio_bytes)} bytes audio.")
+            return audio_bytes
+        except Exception as e:
+            logger.error(f"[CartesiaTTS] EdgeTTS fallback synthesis failed: {e}")
+            return b""
+
     async def synthesize(self, text: str, voice_id: Optional[str] = None) -> bytes:
-        """Synthesize text to 24kHz PCM WAV bytes using Cartesia Sonic Neural Voice."""
+        """Synthesize text to audio bytes using Cartesia Sonic-2 with Edge-TTS failover."""
         if not text or not text.strip():
             return b""
 
@@ -70,7 +99,7 @@ class CartesiaTTS(BaseTTS):
         for attempt in range(attempts):
             api_key = self._get_active_api_key()
             if not api_key:
-                raise RuntimeError("[CartesiaTTS] No Cartesia API key configured in CARTESIA_API_KEY or CARTESIA_API_KEYS.")
+                break
 
             headers = {
                 "X-API-Key": api_key,
@@ -110,24 +139,29 @@ class CartesiaTTS(BaseTTS):
                     return audio_bytes
 
                 # Handle quota / rate limit / bad key errors with rotation
-                if response.status_code in (401, 402, 429):
+                if response.status_code in (401, 402):
                     logger.warning(
-                        f"[CartesiaTTS] Key returned HTTP {response.status_code}: {response.text}. Rotating key."
+                        f"[CartesiaTTS] Key returned HTTP {response.status_code}. Pruning dead key."
                     )
-                    self._rotate_api_key()
+                    self._rotate_api_key(permanent_failure=True)
+                    continue
+                elif response.status_code == 429:
+                    logger.warning(f"[CartesiaTTS] Rate limited (429). Rotating key.")
+                    self._rotate_api_key(permanent_failure=False)
                     continue
                 else:
                     response.raise_for_status()
 
             except httpx.HTTPStatusError as e:
                 logger.warning(f"[CartesiaTTS] HTTP error ({e.response.status_code}): {e}")
-                self._rotate_api_key()
+                self._rotate_api_key(permanent_failure=(e.response.status_code in (401, 402)))
             except Exception as e:
                 logger.error(f"[CartesiaTTS] Synthesis request error: {e}")
-                if attempt == attempts - 1:
-                    raise e
+                self._rotate_api_key(permanent_failure=False)
 
-        raise RuntimeError("[CartesiaTTS] All Cartesia API keys exhausted or failed to synthesize.")
+        # Fallback to Edge-TTS if Cartesia keys are exhausted or rate limited
+        logger.warning("[CartesiaTTS] Cartesia key pool exhausted. Engaging Microsoft Edge Neural TTS fallback.")
+        return await self._synthesize_edge_fallback(text.strip())
 
     async def stream_synthesize(self, text: str) -> AsyncGenerator[bytes, None]:
         """Stream synthesized audio bytes."""

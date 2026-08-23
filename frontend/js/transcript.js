@@ -1,25 +1,117 @@
 /**
  * VISION AI — Transcript & Waveform Module
- * Live transcription logging, waveform visualization, clipboard export
+ * Persistent conversation logging in `data/conversations.json`,
+ * real-time word-by-word streaming while speaking, and JSON clipboard export.
  */
 
 const VisionTranscript = (() => {
   let wavePhase = 0;
   let currentWaveAmp = 0;
+  let activeLiveEntry = null;
+  let activeStreamAbort = null;
 
-  const transcriptHistory = [
-    {
-      speaker: 'ai',
-      label: 'VISION',
-      text: 'VISION is online. Continuous hands-free VAD speech recognition is active.',
-      time: 'System',
-      timestamp: new Date().toISOString()
+  // Local copy of persistent conversation history
+  let transcriptHistory = loadFromLocalStorage();
+
+  function loadFromLocalStorage() {
+    try {
+      const saved = localStorage.getItem('vision_conversations_history');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed;
+        }
+      }
+    } catch (e) {
+      console.warn('[VisionTranscript] LocalStorage read warning:', e);
     }
-  ];
+    return [
+      {
+        index: 1,
+        speaker: 'ai',
+        label: 'VISION',
+        text: 'VISION is online. Continuous hands-free VAD speech recognition is active.',
+        time: 'System',
+        timestamp: new Date().toISOString()
+      }
+    ];
+  }
+
+  function saveConversations() {
+    try {
+      localStorage.setItem('vision_conversations_history', JSON.stringify(transcriptHistory));
+
+      // Persist directly into data/conversations.json on backend
+      fetch('/api/conversations/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversations: transcriptHistory })
+      }).catch((e) => console.debug('[VisionTranscript] Sync background note:', e));
+    } catch (e) {
+      console.warn('[VisionTranscript] Storage error:', e);
+    }
+  }
+
+  async function fetchBackendConversations() {
+    try {
+      const res = await fetch('/api/conversations');
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.conversations) && data.conversations.length > 0) {
+          transcriptHistory = data.conversations;
+          localStorage.setItem('vision_conversations_history', JSON.stringify(transcriptHistory));
+          renderFullTranscriptDOM();
+          return;
+        }
+      }
+    } catch (err) {
+      console.debug('[VisionTranscript] Backend conversations fetch notice:', err);
+    }
+    renderFullTranscriptDOM();
+  }
 
   function init() {
+    // Render initial DOM from cache immediately, then fetch latest from data/conversations.json
+    renderFullTranscriptDOM();
+    fetchBackendConversations();
+
+    // Wire up Copy JSON button
+    const copyBtn = document.getElementById('copy-transcripts-btn');
+    if (copyBtn) {
+      copyBtn.onclick = (e) => {
+        e.preventDefault();
+        copyAsJSON();
+      };
+    }
+
     // Start waveform rendering loop
     requestAnimationFrame(renderLoop);
+  }
+
+  function renderFullTranscriptDOM() {
+    const stream = document.getElementById('transcriptions-stream');
+    if (!stream) return;
+
+    stream.innerHTML = '';
+    // Display in reverse order (newest on top)
+    const reversed = [...transcriptHistory].reverse();
+    reversed.forEach((item) => {
+      const entry = document.createElement('div');
+      entry.className = `transcript-entry ${item.speaker || 'ai'}`;
+      const speakerIcon = item.speaker === 'user' ? 'user' : 'bot';
+      entry.innerHTML = `
+        <div class="transcript-meta">
+          <span class="transcript-speaker">
+            <i data-lucide="${speakerIcon}" class="icon-xs"></i>
+            <span>${escapeHtml(item.label || (item.speaker === 'user' ? 'You' : 'VISION'))}</span>
+          </span>
+          <span class="transcript-time">${escapeHtml(item.time || 'System')}</span>
+        </div>
+        <div class="transcript-text">${renderMarkdown(item.text || '')}</div>
+      `;
+      stream.appendChild(entry);
+    });
+    refreshIcons();
   }
 
   function renderLoop() {
@@ -32,6 +124,12 @@ const VisionTranscript = (() => {
     const stream = document.getElementById('transcriptions-stream');
     if (!stream) return;
 
+    // If an active live streaming transcript is in progress for this speaker, finalize it
+    if (activeLiveEntry && activeLiveEntry.speaker === speaker) {
+      finishLiveTranscript(text);
+      return;
+    }
+
     const entry = document.createElement('div');
     entry.className = `transcript-entry ${speaker}`;
 
@@ -40,9 +138,14 @@ const VisionTranscript = (() => {
     const speakerIcon = speaker === 'user' ? 'user' : 'bot';
 
     transcriptHistory.push({
-      speaker, label, text, time,
+      index: transcriptHistory.length + 1,
+      speaker,
+      label,
+      text,
+      time,
       timestamp: now.toISOString()
     });
+    saveConversations();
 
     entry.innerHTML = `
       <div class="transcript-meta">
@@ -55,8 +158,237 @@ const VisionTranscript = (() => {
       <div class="transcript-text">${renderMarkdown(text)}</div>
     `;
     stream.prepend(entry);
-    while (stream.children.length > 25) stream.lastChild.remove();
+    while (stream.children.length > 50) stream.lastChild.remove();
     refreshIcons();
+  }
+
+  // ── Start Live Word-by-Word Streaming Transcript ──
+  function startLiveTranscript(speaker = 'ai', label = 'VISION') {
+    const stream = document.getElementById('transcriptions-stream');
+    if (!stream) return null;
+
+    // If already streaming, cleanly finalize previous
+    if (activeLiveEntry) {
+      finishLiveTranscript(activeLiveEntry.fullRawText);
+    }
+
+    if (activeStreamAbort) {
+      try { activeStreamAbort.abort(); } catch (e) {}
+      activeStreamAbort = null;
+    }
+    activeStreamAbort = new AbortController();
+
+    const entry = document.createElement('div');
+    entry.className = `transcript-entry ${speaker} streaming`;
+
+    const speakerIcon = speaker === 'user' ? 'user' : 'bot';
+
+    entry.innerHTML = `
+      <div class="transcript-meta">
+        <span class="transcript-speaker">
+          <i data-lucide="${speakerIcon}" class="icon-xs"></i>
+          <span>${escapeHtml(label)}</span>
+        </span>
+        <span class="transcript-time-slot">
+          <div class="transcript-live-pill">
+            <span class="live-mini-equalizer">
+              <span class="live-mini-bar"></span>
+              <span class="live-mini-bar"></span>
+              <span class="live-mini-bar"></span>
+            </span>
+            <span>SPEAKING</span>
+          </div>
+        </span>
+      </div>
+      <div class="transcript-text live-words-container">
+        <span class="transcript-words"></span><span class="transcript-cursor"></span>
+      </div>
+    `;
+
+    stream.prepend(entry);
+    refreshIcons();
+
+    const wordsContainer = entry.querySelector('.transcript-words');
+    const timeSlot = entry.querySelector('.transcript-time-slot');
+    const textContainer = entry.querySelector('.transcript-text');
+
+    activeLiveEntry = {
+      element: entry,
+      wordsContainer,
+      timeSlot,
+      textContainer,
+      speaker,
+      label,
+      wordCount: 0,
+      fullRawText: ''
+    };
+
+    return activeLiveEntry;
+  }
+
+  // ── Append Word into Live Transcript ──
+  function appendLiveWord(word) {
+    if (!activeLiveEntry || !activeLiveEntry.wordsContainer) {
+      startLiveTranscript('ai', 'VISION');
+    }
+    if (!activeLiveEntry || !activeLiveEntry.wordsContainer) return;
+
+    activeLiveEntry.fullRawText += (activeLiveEntry.fullRawText ? ' ' : '') + word;
+    activeLiveEntry.wordCount++;
+
+    const wordSpan = document.createElement('span');
+    wordSpan.className = 'transcript-word active-spoken';
+    wordSpan.textContent = word + ' ';
+
+    // Remove active highlight from previous word
+    const prevWords = activeLiveEntry.wordsContainer.querySelectorAll('.transcript-word.active-spoken');
+    prevWords.forEach((pw) => pw.classList.remove('active-spoken'));
+
+    activeLiveEntry.wordsContainer.appendChild(wordSpan);
+
+    // Auto-scroll transcript container if needed
+    const stream = document.getElementById('transcriptions-stream');
+    if (stream) stream.scrollTop = 0;
+  }
+
+  // ── Stream Words in Real-Time During Speech ──
+  async function streamSpokenText(fullText, options = {}) {
+    if (!fullText || typeof fullText !== 'string') return;
+
+    const words = fullText.trim().split(/\s+/);
+    if (words.length === 0) return;
+
+    startLiveTranscript('ai', options.label || 'VISION');
+
+    const signal = activeStreamAbort ? activeStreamAbort.signal : null;
+
+    for (let i = 0; i < words.length; i++) {
+      if (signal && signal.aborted) break;
+      if (!activeLiveEntry) break;
+
+      const word = words[i];
+      appendLiveWord(word);
+
+      if (typeof options.onWord === 'function') {
+        options.onWord(word, i, words.length);
+      }
+
+      // Calibrated speech pacing matching Sonic-2 (~160 WPM = ~200ms per word + natural punctuation pauses)
+      let delayMs = 175;
+      if (/[.,!?:;]$/.test(word)) {
+        delayMs = 280; // Clause/sentence pause
+      } else if (word.length > 7) {
+        delayMs = 220; // Multisyllable word
+      }
+
+      try {
+        await new Promise((resolve, reject) => {
+          const timeout = setTimeout(resolve, delayMs);
+          if (signal) {
+            signal.addEventListener('abort', () => {
+              clearTimeout(timeout);
+              reject(new DOMException('Aborted', 'AbortError'));
+            }, { once: true });
+          }
+        });
+      } catch (err) {
+        break; // Interrupted / barge-in
+      }
+    }
+
+    if (activeLiveEntry && (!signal || !signal.aborted)) {
+      finishLiveTranscript(fullText);
+      if (typeof options.onComplete === 'function') {
+        options.onComplete();
+      }
+    }
+  }
+
+  // ── Finalize the Live Streaming Transcript Entry ──
+  function finishLiveTranscript(finalText) {
+    if (!activeLiveEntry) return;
+
+    const { element, timeSlot, textContainer, speaker, label, fullRawText } = activeLiveEntry;
+    const textToSave = finalText || fullRawText || '';
+
+    if (element) {
+      element.classList.remove('streaming');
+      const cursor = element.querySelector('.transcript-cursor');
+      if (cursor) cursor.remove();
+    }
+
+    const now = new Date();
+    const time = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+    if (timeSlot) {
+      timeSlot.innerHTML = `<span class="transcript-time">${time}</span>`;
+    }
+
+    if (textContainer && textToSave) {
+      textContainer.innerHTML = renderMarkdown(textToSave);
+    }
+
+    transcriptHistory.push({
+      index: transcriptHistory.length + 1,
+      speaker,
+      label,
+      text: textToSave,
+      time,
+      timestamp: now.toISOString()
+    });
+    saveConversations();
+
+    activeLiveEntry = null;
+    activeStreamAbort = null;
+    refreshIcons();
+  }
+
+  // ── Cancel/Interrupt Live Streaming (Barge-In) ──
+  function cancelLiveTranscript() {
+    if (activeStreamAbort) {
+      try { activeStreamAbort.abort(); } catch (e) {}
+      activeStreamAbort = null;
+    }
+
+    if (!activeLiveEntry) return;
+
+    const { element, timeSlot, textContainer, speaker, label, fullRawText } = activeLiveEntry;
+    const textToSave = (fullRawText || '').trim();
+
+    if (element) {
+      element.classList.remove('streaming');
+      const cursor = element.querySelector('.transcript-cursor');
+      if (cursor) cursor.remove();
+    }
+
+    const now = new Date();
+    const time = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+    if (timeSlot) {
+      timeSlot.innerHTML = `<span class="transcript-time">${time}</span> <span class="transcript-interrupted-tag">INTERRUPTED</span>`;
+    }
+
+    if (textContainer) {
+      const currentWords = activeLiveEntry.wordsContainer ? activeLiveEntry.wordsContainer.innerHTML : renderMarkdown(textToSave);
+      textContainer.innerHTML = currentWords + ' <span class="transcript-interrupted-tag">... [Interrupted]</span>';
+    }
+
+    transcriptHistory.push({
+      index: transcriptHistory.length + 1,
+      speaker,
+      label,
+      text: textToSave + ' ... [Interrupted]',
+      time,
+      timestamp: now.toISOString()
+    });
+    saveConversations();
+
+    activeLiveEntry = null;
+    refreshIcons();
+  }
+
+  function isLiveStreaming() {
+    return activeLiveEntry !== null;
   }
 
   // ── Log to Autonomous Action Monitor ──
@@ -87,20 +419,11 @@ const VisionTranscript = (() => {
   async function copyAsJSON() {
     const copyBtn = document.getElementById('copy-transcripts-btn');
 
-    let exportList = transcriptHistory.map((item, idx) => ({
-      index: idx + 1,
-      speaker: item.speaker,
-      label: item.label,
-      text: item.text,
-      time: item.time,
-      timestamp: item.timestamp || new Date().toISOString()
-    }));
-
     const payload = {
       exported_at: new Date().toISOString(),
-      total_messages: exportList.length,
+      total_messages: transcriptHistory.length,
       session_id: 'vision_hud_session',
-      transcripts: exportList
+      transcripts: transcriptHistory
     };
 
     const jsonStr = JSON.stringify(payload, null, 2);
@@ -142,6 +465,7 @@ const VisionTranscript = (() => {
         copyBtn.innerHTML = `<i data-lucide="alert-circle" class="icon-xs"></i><span class="copy-btn-text">FAILED</span>`;
         refreshIcons();
         setTimeout(() => {
+          copyBtn.classList.remove('copied');
           copyBtn.innerHTML = `<i data-lucide="copy" class="icon-xs"></i><span class="copy-btn-text">COPY JSON</span>`;
           refreshIcons();
         }, 2000);
@@ -158,7 +482,7 @@ const VisionTranscript = (() => {
 
     const agentState = (typeof VisionOrb !== 'undefined' && VisionOrb.getState) ? VisionOrb.getState() : 'idle';
     const audioFrequencyData = (typeof VisionOrb !== 'undefined' && VisionOrb.getAudioData) ? VisionOrb.getAudioData() : null;
-    const isSpeaking = (agentState === 'speaking');
+    const isSpeaking = (agentState === 'speaking' || activeLiveEntry !== null);
     const isListening = (agentState === 'listening');
     const targetAmp = (isSpeaking || isListening) ? 1.0 : 0.0;
 
@@ -277,5 +601,16 @@ const VisionTranscript = (() => {
     if (window.lucide && lucide.createIcons) lucide.createIcons();
   }
 
-  return { init, logTranscript, logAction, copyAsJSON };
+  return {
+    init,
+    logTranscript,
+    logAction,
+    copyAsJSON,
+    startLiveTranscript,
+    appendLiveWord,
+    streamSpokenText,
+    finishLiveTranscript,
+    cancelLiveTranscript,
+    isLiveStreaming
+  };
 })();

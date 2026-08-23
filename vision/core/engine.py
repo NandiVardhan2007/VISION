@@ -189,44 +189,64 @@ class VisionEngine:
         
         await event_bus.publish(VisionEvents.SYSTEM_STARTED)
 
-    async def speak_pipelined(self, text: str) -> bool:
+    async def speak_pipelined(
+        self,
+        text: str,
+        voice_id: Optional[str] = None,
+        playback_started_event: Optional[asyncio.Event] = None,
+        session_id: str = "default_session"
+    ) -> bool:
         """
         Synthesize and stream voice playback with zero-latency pipelining and barge-in.
         - For conversational responses (< 350 chars), synthesizes the entire natural response
           in one ultra-fast Cartesia call (<180ms) for 100% natural prosody with zero gaps.
         - For longer multi-paragraph responses, uses an async producer-consumer pipeline
-          so chunk N+1 is pre-synthesized in the background while chunk N is playing,
-          ensuring 0ms gap between sentences.
+          so chunk N+1 is pre-synthesized in the background while chunk N is playing.
         """
         if not text or not self.tts:
+            if playback_started_event and not playback_started_event.is_set():
+                playback_started_event.set()
             return True
 
         spoken_text = clean_text_for_speech(text)
         if not spoken_text:
+            if playback_started_event and not playback_started_event.is_set():
+                playback_started_event.set()
             return True
 
         this_gen = self._current_speech_gen
         if audio_player.is_interrupted():
+            if playback_started_event and not playback_started_event.is_set():
+                playback_started_event.set()
             return False
 
-        # Fast path: For standard conversational turn, synthesize as a single fluid block
+        # Fast path: For conversational turns, synthesize as a single fluid block
         if len(spoken_text) <= 350:
             if audio_player.is_interrupted() or self._current_speech_gen != this_gen:
+                if playback_started_event and not playback_started_event.is_set():
+                    playback_started_event.set()
                 return False
             try:
                 audio_bytes = await self.tts.synthesize(spoken_text)
+                if playback_started_event and not playback_started_event.is_set():
+                    playback_started_event.set()
                 if audio_bytes and not audio_player.is_interrupted() and self._current_speech_gen == this_gen:
                     return await asyncio.to_thread(audio_player.play_wav_bytes, audio_bytes, True, False)
                 return False
             except Exception as e:
                 logger.error(f"[VisionEngine] Speech synthesis error: {e}")
+                if playback_started_event and not playback_started_event.is_set():
+                    playback_started_event.set()
                 return False
 
-        # Long text path: Group into cohesive multi-sentence paragraph chunks (~200 chars each)
-        raw_chunks = re.split(r'(?<=[.!?\n])\s+', spoken_text)
+        this_gen = self._current_speech_gen
+        audio_player.reset_interrupt()
+
+        # Split text into natural sentence/clause chunks (~150-250 characters each)
+        raw_sentences = re.split(r'(?<=[.!?])\s+', spoken_text)
         chunks = []
         cur = ""
-        for s in raw_chunks:
+        for s in raw_sentences:
             s = s.strip()
             if not s:
                 continue
@@ -240,16 +260,22 @@ class VisionEngine:
             chunks.append(cur)
 
         if not chunks:
+            if playback_started_event and not playback_started_event.is_set():
+                playback_started_event.set()
             return True
 
         if len(chunks) == 1:
             try:
                 audio_bytes = await self.tts.synthesize(chunks[0])
+                if playback_started_event and not playback_started_event.is_set():
+                    playback_started_event.set()
                 if audio_bytes and not audio_player.is_interrupted() and self._current_speech_gen == this_gen:
                     return await asyncio.to_thread(audio_player.play_wav_bytes, audio_bytes, True, False)
                 return False
             except Exception as e:
                 logger.error(f"[VisionEngine] Speech synthesis error: {e}")
+                if playback_started_event and not playback_started_event.is_set():
+                    playback_started_event.set()
                 return False
 
         # Asynchronous Producer-Consumer pipeline for gapless background prefetching
@@ -282,10 +308,14 @@ class VisionEngine:
                     break
                 if audio_player.is_interrupted() or self._current_speech_gen != this_gen:
                     break
+                if playback_started_event and not playback_started_event.is_set():
+                    playback_started_event.set()
                 completed = await asyncio.to_thread(audio_player.play_wav_bytes, audio_bytes, True, False)
                 if not completed:
                     break
         finally:
+            if playback_started_event and not playback_started_event.is_set():
+                playback_started_event.set()
             if not producer_task.done():
                 producer_task.cancel()
 
@@ -295,7 +325,10 @@ class VisionEngine:
         self,
         messages: List[Dict[str, Any]],
         temperature: float = 0.6,
-        max_tokens: Optional[int] = 1024
+        max_tokens: Optional[int] = 1024,
+        token_callback: Optional[Any] = None,
+        session_id: str = "default_session",
+        playback_started_event: Optional[asyncio.Event] = None
     ) -> str:
         """
         Stream LLM tokens in real-time and start TTS on each sentence as soon as
@@ -338,10 +371,14 @@ class VisionEngine:
                         break
                     if audio_player.is_interrupted() or self._current_speech_gen != this_gen:
                         break
+                    if playback_started_event and not playback_started_event.is_set():
+                        playback_started_event.set()
                     completed = await asyncio.to_thread(audio_player.play_wav_bytes, audio_bytes, True, False)
                     if not completed:
                         break
             finally:
+                if playback_started_event and not playback_started_event.is_set():
+                    playback_started_event.set()
                 producer_done.set()
 
         text_queue: asyncio.Queue = asyncio.Queue(maxsize=8)
@@ -359,6 +396,18 @@ class VisionEngine:
 
                 full_text += token
                 sentence_buffer += token
+
+                # Publish event to event_bus for real-time WebSocket listeners
+                await event_bus.publish(VisionEvents.LLM_STREAM_CHUNK, {"text": token, "session_id": session_id})
+
+                # Invoke token callback if provided (e.g. SSE streaming route)
+                if token_callback:
+                    try:
+                        res = token_callback(token)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception as cb_err:
+                        logger.debug(f"[VisionEngine] token_callback exception: {cb_err}")
 
                 # Check for sentence boundaries in the buffer
                 while True:
@@ -385,14 +434,15 @@ class VisionEngine:
             logger.error(f"[VisionEngine] LLM streaming error: {e}")
         finally:
             await text_queue.put(None)
-            try:
-                await asyncio.wait_for(producer_done.wait(), timeout=120)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
-            if not tts_task.done():
-                tts_task.cancel()
-            if not playback_task.done():
-                playback_task.cancel()
+            # Store active speech task in self._current_speech_task so barge-in can cancel it
+            self._current_speech_task = playback_task
+
+            # Wait briefly for audio playback to commence so response and audio are synchronized
+            if playback_started_event and not playback_started_event.is_set():
+                try:
+                    await asyncio.wait_for(playback_started_event.wait(), timeout=1.5)
+                except Exception:
+                    pass
 
         return full_text
 
@@ -401,7 +451,8 @@ class VisionEngine:
         user_text: str,
         session_id: str = "default_session",
         channel: str = "web",
-        synthesize_voice: bool = True
+        synthesize_voice: bool = True,
+        token_callback: Optional[Any] = None
     ) -> Dict[str, Any]:
         """Core multi-turn conversational loop with CAG caching, MAG memory, dynamic tool calling & pipelined voice."""
         start_time = time.time()
@@ -425,9 +476,24 @@ class VisionEngine:
             session.add_message(role="assistant", content=final_text)
             await event_bus.publish(VisionEvents.LLM_RESPONSE_DONE, {"text": final_text, "session_id": session_id, "cached": True})
 
+            if token_callback:
+                try:
+                    res = token_callback(final_text)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
+
             if synthesize_voice and final_text:
                 audio_player.reset_interrupt()
-                await self.speak_pipelined(final_text)
+                playback_started = asyncio.Event()
+                self._current_speech_task = asyncio.create_task(
+                    self.speak_pipelined(final_text, playback_started_event=playback_started, session_id=session_id)
+                )
+                try:
+                    await asyncio.wait_for(playback_started.wait(), timeout=1.5)
+                except Exception:
+                    pass
 
             return {
                 "session_id": session_id,
@@ -518,10 +584,18 @@ class VisionEngine:
             session.add_message(role="assistant", content=final_text)
             await event_bus.publish(VisionEvents.LLM_RESPONSE_DONE, {"text": final_text, "session_id": session_id})
 
-            # Spoken response for tool results
+            if token_callback:
+                try:
+                    res = token_callback(final_text)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
+
+            # Spoken response for tool results (non-blocking background playback)
             if synthesize_voice and final_text:
                 audio_player.reset_interrupt()
-                await self.speak_pipelined(final_text)
+                self._current_speech_task = asyncio.create_task(self.speak_pipelined(final_text))
 
         else:
             # ── Pure conversational: STREAM LLM + live TTS ──────────────
@@ -531,7 +605,9 @@ class VisionEngine:
                 final_text = await self._stream_and_speak(
                     messages=llm_messages,
                     temperature=0.6,
-                    max_tokens=1024
+                    max_tokens=1024,
+                    token_callback=token_callback,
+                    session_id=session_id
                 )
             else:
                 final_text = ""
@@ -541,6 +617,14 @@ class VisionEngine:
                     max_tokens=1024
                 ):
                     final_text += token
+                    await event_bus.publish(VisionEvents.LLM_STREAM_CHUNK, {"text": token, "session_id": session_id})
+                    if token_callback:
+                        try:
+                            res = token_callback(token)
+                            if asyncio.iscoroutine(res):
+                                await res
+                        except Exception:
+                            pass
 
             if not final_text:
                 final_text = ""
