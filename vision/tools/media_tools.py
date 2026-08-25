@@ -5,6 +5,7 @@ and hotkey playback controls (full-screen, 10s/30s seek forwarding, rewinding, p
 """
 
 import os
+import re
 import time
 import urllib.parse
 import subprocess

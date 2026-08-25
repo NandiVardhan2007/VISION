@@ -8,11 +8,19 @@ from vision.config import config
 from vision.logger import logger
 
 
-def _run_adb_cmd(cmd: str) -> str:
+def _run_adb_cmd(cmd: str, timeout: int = 10) -> str:
     full_cmd = f"{config.ADB_PATH} -s {config.VISION_PHONE_IP}:{config.VISION_PHONE_PORT} {cmd}"
     try:
-        res = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=10)
+        res = subprocess.run(full_cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        if res.returncode != 0 and not res.stdout.strip():
+            err = (res.stderr or "").strip()
+            return f"ADB Error (exit {res.returncode}): {err[:200]}" if err else f"ADB Error (exit {res.returncode})"
         return res.stdout.strip() or "Success"
+    except FileNotFoundError:
+        logger.error(f"[MobileTool] ADB binary not found at '{config.ADB_PATH}'. Set ADB_PATH in .env.")
+        return f"Error: ADB not found at '{config.ADB_PATH}'. Install platform-tools or set ADB_PATH."
+    except subprocess.TimeoutExpired:
+        return f"ADB Error: command timed out after {timeout}s"
     except Exception as e:
         return f"ADB Error: {e}"
 
@@ -21,8 +29,18 @@ def _run_adb_cmd(cmd: str) -> str:
 def connect_phone() -> str:
     """Connect to phone ADB over Wi-Fi."""
     cmd = f"{config.ADB_PATH} connect {config.VISION_PHONE_IP}:{config.VISION_PHONE_PORT}"
-    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    return res.stdout.strip()
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+        out = (res.stdout or "").strip()
+        if "connected" in out.lower():
+            return out
+        err = (res.stderr or "").strip()
+        return out or err or "No response from device (is wireless debugging on?)"
+    except FileNotFoundError:
+        logger.error(f"[MobileTool] ADB binary not found at '{config.ADB_PATH}'. Set ADB_PATH in .env.")
+        return f"Error: ADB not found at '{config.ADB_PATH}'. Install platform-tools or set ADB_PATH."
+    except Exception as e:
+        return f"ADB Error: {e}"
 
 
 @tool(name="unlock_phone", description="Wake up and unlock the connected Android phone.")

@@ -78,8 +78,20 @@ def _execute_java(
         source_file = None
         class_name = "Main"
 
-        # Check if code_or_file is an existing file
-        candidate_p = _resolve_user_path(code_or_file, find_existing_file=True) if len(code_or_file) < 300 else None
+        # Same path-vs-snippet guard as the Python runner: a bare snippet must
+        # never go through fuzzy path resolution.
+        candidate_p = None
+        looks_like_path = (
+            len(code_or_file) < 300
+            and "\n" not in code_or_file
+            and (("/" in code_or_file) or ("\\" in code_or_file)
+                 or code_or_file.lower().endswith((".java", ".py", ".c", ".cpp", ".js")))
+        )
+        if looks_like_path:
+            try:
+                candidate_p = _resolve_user_path(code_or_file, find_existing_file=True)
+            except Exception:
+                candidate_p = None
         if candidate_p and candidate_p.exists() and candidate_p.is_file():
             source_file = candidate_p
             class_name = candidate_p.stem
@@ -176,7 +188,21 @@ def _execute_python(
     """Execute Python code or file with stdin input."""
     start_time = time.time()
     try:
-        candidate_p = _resolve_user_path(code_or_file, find_existing_file=True) if len(code_or_file) < 300 else None
+        # Only treat the input as a FILE PATH when it actually looks like one.
+        # A bare code snippet must never be fed into fuzzy path resolution —
+        # it once matched an unrelated page.js on disk and executed THAT.
+        candidate_p = None
+        looks_like_path = (
+            len(code_or_file) < 300
+            and "\n" not in code_or_file
+            and (("/" in code_or_file) or ("\\" in code_or_file)
+                 or code_or_file.lower().endswith((".py", ".java", ".c", ".cpp", ".js")))
+        )
+        if looks_like_path:
+            try:
+                candidate_p = _resolve_user_path(code_or_file, find_existing_file=True)
+            except Exception:
+                candidate_p = None
         if candidate_p and candidate_p.exists() and candidate_p.is_file():
             cmd = [sys.executable, str(candidate_p)]
             cwd = working_dir or str(candidate_p.parent)
@@ -390,6 +416,11 @@ def diagnose_and_fix_code_error(
     target = _resolve_user_path(file_path, find_existing_file=True)
     if not target or not target.exists():
         return f"Error: Target file '{file_path}' does not exist."
+    if target.is_dir():
+        return (
+            f"Error: '{target}' is a directory, not a source file. "
+            f"Please provide the full path to the .java/.py/.cpp file to fix."
+        )
 
     current_code = target.read_text(encoding="utf-8", errors="replace")
 

@@ -106,11 +106,17 @@ class VisionConfig:
         except (ValueError, TypeError):
             self.VISION_PHONE_PORT: int = 42381
         self.VISION_PHONE_PASSWORD: str = os.getenv("VISION_PHONE_PASSWORD", "1234")
+        self.ADB_PATH: str = os.getenv("ADB_PATH", "adb")
 
         # ── Media & System ───────────────────────────────────
         self.YOUTUBE_API_KEY: Optional[str] = os.getenv("YOUTUBE_API_KEY")
-        self.EMAIL_SENDER: Optional[str] = os.getenv("EMAIL_SENDER")
-        self.EMAIL_PASSWORD: Optional[str] = os.getenv("EMAIL_PASSWORD")
+        self.VISION_EMAIL: Optional[str] = os.getenv("VISION_EMAIL") or os.getenv("EMAIL_SENDER")
+        self.EMAIL_PASSWORD: Optional[str] = os.getenv("VISION_EMAIL_PASSWORD") or os.getenv("EMAIL_PASSWORD")
+        self.EMAIL_SMTP_HOST: str = os.getenv("EMAIL_SMTP_HOST", "smtp.gmail.com")
+        try:
+            self.EMAIL_SMTP_PORT: int = int(os.getenv("EMAIL_SMTP_PORT", "587"))
+        except (ValueError, TypeError):
+            self.EMAIL_SMTP_PORT: int = 587
 
         # ── Remote Ubuntu Server & KPR Watchdog ──────────────
         self.UBUNTU_SERVER_HOST: str = os.getenv("UBUNTU_SERVER_HOST", "100.93.70.63")
@@ -131,6 +137,14 @@ class VisionConfig:
             self.PORT: int = 8000
         self.DEBUG: bool = os.getenv("DEBUG", "False").lower() in ("true", "1", "yes")
         self.SECRET_KEY: str = os.getenv("SECRET_KEY", "vision-default-secret-key-change-me")
+
+        # ── Custom Fine-Tuned Model Endpoint ─────────────────
+        self.CUSTOM_MODEL_URL: str = os.getenv("CUSTOM_MODEL_URL", "http://localhost:11434/v1")
+        self.CUSTOM_MODEL_NAME: str = os.getenv("CUSTOM_MODEL_NAME", "vision-tool-calling-qlora")
+        self.CUSTOM_MODEL_API_KEY: str = os.getenv("CUSTOM_MODEL_API_KEY", "ollama")
+        self.ENABLE_CUSTOM_MODEL_PROVIDER: bool = os.getenv(
+            "ENABLE_CUSTOM_MODEL_PROVIDER", "False"
+        ).lower() in ("true", "1", "yes")
 
 
 config = VisionConfig()

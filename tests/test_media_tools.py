@@ -27,10 +27,11 @@ def test_media_tools_registered():
         assert t in tool_registry._tools, f"Tool '{t}' was not found in tool_registry"
 
 
+@patch("vision.tools.media_tools._extract_top_youtube_video_id", return_value=None)
 @patch("vision.tools.media_tools.webbrowser.open")
 @patch("vision.tools.media_tools._get_comet_browser_path")
-def test_play_youtube_video_comet(mock_get_path, mock_web_open):
-    """Test searching and launching YouTube in Comet browser."""
+def test_play_youtube_video_comet(mock_get_path, mock_web_open, mock_extract):
+    """Test searching and launching YouTube in Comet browser (search-results URL)."""
     mock_get_path.return_value = r"C:\Program Files\Perplexity\Comet\Application\comet.exe"
 
     with patch("subprocess.Popen") as mock_popen:
@@ -40,7 +41,9 @@ def test_play_youtube_video_comet(mock_get_path, mock_web_open):
         mock_popen.assert_called_once()
         args = mock_popen.call_args[0][0]
         assert "comet.exe" in args[0].lower()
-        assert "vishwanath%20and%20sons" in args[1].lower() or "vishwanath" in args[1].lower()
+        # No top-video resolution -> falls back to the search results page
+        assert "youtube.com/results" in args[1].lower()
+        assert "vishwanath%20and%20sons" in args[1].lower()
 
 
 @patch("vision.tools.media_tools.pyautogui")

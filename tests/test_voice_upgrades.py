@@ -46,8 +46,10 @@ async def test_cartesia_tts_key_rotation():
     with patch.object(tts, "_get_client", return_value=mock_client):
         audio = await tts.synthesize("Hello world")
         assert audio == b"RIFF....WAVEfmt ...."
-        # Should have rotated key
-        assert tts.current_key_index == 1
+        # A 402 permanently prunes the exhausted key: key1 is removed and the
+        # pool now contains only the surviving key(s).
+        assert "key1" not in tts.api_keys
+        assert tts._get_active_api_key() != "key1"
 
 
 def test_clean_text_for_speech():

@@ -13,8 +13,8 @@ from vision.logger import logger
 @tool(name="send_email", description="Send an email to a recipient address with subject and body.")
 def send_email(to_address: str, subject: str, body: str) -> str:
     """Send email via SMTP."""
-    if not config.VISION_EMAIL or not config.VISION_EMAIL_PASSWORD:
-        return "Error: VISION_EMAIL or VISION_EMAIL_PASSWORD not configured."
+    if not config.VISION_EMAIL or not config.EMAIL_PASSWORD:
+        return "Error: VISION_EMAIL / VISION_EMAIL_PASSWORD not configured (set VISION_EMAIL and VISION_EMAIL_PASSWORD in .env)."
 
     try:
         msg = MIMEMultipart()
@@ -23,9 +23,9 @@ def send_email(to_address: str, subject: str, body: str) -> str:
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain"))
 
-        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server = smtplib.SMTP(config.EMAIL_SMTP_HOST, config.EMAIL_SMTP_PORT, timeout=15)
         server.starttls()
-        server.login(config.VISION_EMAIL, config.VISION_EMAIL_PASSWORD)
+        server.login(config.VISION_EMAIL, config.EMAIL_PASSWORD)
         server.send_message(msg)
         server.quit()
         return f"Successfully sent email to {to_address} with subject '{subject}'."

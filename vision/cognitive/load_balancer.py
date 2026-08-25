@@ -60,6 +60,16 @@ class LoadBalancer:
                 GeminiLLMProvider(api_key=config.GEMINI_API_KEY)
             )
 
+        # 5. Custom fine-tuned model (local Ollama/vLLM/llama.cpp endpoint)
+        # Opt-in via ENABLE_CUSTOM_MODEL_PROVIDER=true so an offline local
+        # endpoint never sits at the front of the failover chain by accident.
+        if getattr(config, "ENABLE_CUSTOM_MODEL_PROVIDER", False):
+            from vision.cognitive.providers.custom_finetuned_llm import (
+                CustomFineTunedLLMProvider,
+            )
+            self.providers.append(CustomFineTunedLLMProvider())
+            logger.info("[LoadBalancer] Custom fine-tuned model provider enabled.")
+
         logger.info(f"[LoadBalancer] Initialized {len(self.providers)} endpoints with strategy '{self.strategy}'.")
 
     def _is_on_cooldown(self, provider: BaseLLMProvider) -> bool:

@@ -179,6 +179,16 @@ def print_document(file_path: str, copies: int = 1, pages: Optional[Union[str, i
     p = _resolve_user_path(file_path, find_existing_file=True)
     if not p.exists():
         return f"Error: Document '{file_path}' does not exist."
+    if p.is_dir():
+        return (
+            f"Error: '{p}' is a folder, not a printable document. "
+            f"Please provide the path to a specific PDF file."
+        )
+    if p.suffix.lower() != ".pdf":
+        return (
+            f"Error: '{p.name}' is not a PDF. The direct GDI printer pipeline "
+            f"only supports .pdf documents (convert or export first)."
+        )
 
     # 1. Verify Printer Connection
     chk = check_printer_available(printer_name)

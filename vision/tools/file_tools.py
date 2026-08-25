@@ -43,10 +43,13 @@ def _find_fuzzy_match_in_directory(parent_dir: Path, target_name: str, recursive
     except Exception:
         return None
 
-    # Filter out hidden/AppData/Recent/cache paths
+    # Filter out hidden/AppData/Recent/cache paths and directories — this helper
+    # locates FILES; a same-named directory must never shadow the real file.
     items = [
         item for item in raw_items
-        if "appdata" not in str(item).lower() and not item.name.startswith(".")
+        if item.is_file()
+        and "appdata" not in str(item).lower()
+        and not item.name.startswith(".")
     ]
 
     # 1. Exact match on full name (prefer real files over .lnk)
