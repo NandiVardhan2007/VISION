@@ -20,6 +20,10 @@ from vision.tools.registry import tool_registry
 
 def test_wake_word_engine_init():
     """Verify WakeWordEngine initializes and handles models gracefully."""
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        pytest.skip("numpy not available on this OS.")
     engine = WakeWordEngine()
     assert engine.sample_rate == 16000
     assert engine.chunk_size == 1280

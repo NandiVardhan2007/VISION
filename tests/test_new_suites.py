@@ -3,6 +3,7 @@ Test suite for Smart Clipboard, Live Translation, Browser Navigation, Power Mana
 """
 
 import os
+import pytest
 from pathlib import Path
 from vision.tools.registry import tool_registry
 from vision.tools.clipboard_translation_tools import read_clipboard, write_to_clipboard, translate_text
@@ -26,6 +27,10 @@ def test_tools_registered():
 
 
 def test_clipboard_tools():
+    try:
+        import pyperclip  # noqa: F401
+    except ImportError:
+        pytest.skip("pyperclip not available on this OS.")
     test_msg = "Hello VISION System"
     res_w = write_to_clipboard(test_msg)
     assert "Successfully copied" in res_w

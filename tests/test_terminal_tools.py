@@ -14,7 +14,9 @@ def test_terminal_tools_registered():
 
 
 def test_command_execution():
-    res = execute_terminal_command("Write-Output 'Hello VISION Developer'", timeout_seconds="30")
+    # Use a shell-agnostic command: echo works in both PowerShell (Windows) and
+    # the default POSIX shell (Linux/macOS).
+    res = execute_terminal_command("echo 'Hello VISION Developer'", timeout_seconds="30")
     assert "Hello VISION Developer" in res
     assert "Exit code: 0" in res
 

@@ -3,10 +3,10 @@ Hardware Control Tools for VISION AI OS.
 Provides native control for Windows audio volume, mute, display brightness, and screen lock.
 """
 
-import ctypes
 from typing import Optional
 from vision.tools.registry import tool
 from vision.logger import logger
+from vision.platform import lock_workstation, IS_WINDOWS
 
 try:
     from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
@@ -200,15 +200,11 @@ def get_brightness_status() -> str:
 
 # ---------------- System Security Controls ----------------
 
-@tool(name="lock_screen", description="Immediately lock the Windows PC workstation.")
+@tool(name="lock_screen", description="Immediately lock the computer workstation / screen.")
 def lock_screen() -> str:
-    """Lock the Windows workstation."""
-    try:
-        ctypes.windll.user32.LockWorkStation()
-        logger.info("[HardwareTools] Workstation locked.")
-        return "Windows workstation locked."
-    except Exception as e:
-        return f"Failed to lock workstation: {e}"
+    """Lock the current workstation."""
+    logger.info("[HardwareTools] Locking workstation...")
+    return lock_workstation()
 
 
 # ---------------- Battery & Hardware Health Monitors ----------------
@@ -281,14 +277,19 @@ def get_hardware_health() -> str:
         ram_free_gb = round(vmem.available / (1024**3), 1)
         lines.append(f"• RAM Usage: {vmem.percent}% ({ram_used_gb} GB used / {ram_total_gb} GB total, {ram_free_gb} GB free)")
 
-        # 3. Storage Disks
+        # 3. Storage Disks (platform-independent mount points)
+        if IS_WINDOWS:
+            disk_roots = ["C:\\", "D:\\"]
+        else:
+            disk_roots = ["/"]
         disk_lines = []
-        for drive in ["C:\\", "D:\\"]:
+        for drive in disk_roots:
             try:
                 du = psutil.disk_usage(drive)
                 d_total_gb = round(du.total / (1024**3), 1)
                 d_free_gb = round(du.free / (1024**3), 1)
-                disk_lines.append(f"{drive[0]}: {du.percent}% ({d_free_gb} GB free / {d_total_gb} GB)")
+                label = drive if IS_WINDOWS else "root (/)"
+                disk_lines.append(f"{label}: {du.percent}% ({d_free_gb} GB free / {d_total_gb} GB)")
             except Exception:
                 pass
         if disk_lines:

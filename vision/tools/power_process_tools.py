@@ -4,7 +4,6 @@ Allows VISION to safely terminate frozen processes, sleep/lock the PC, schedule 
 """
 
 import os
-import subprocess
 import time
 
 try:
@@ -15,6 +14,14 @@ except ImportError:
 from typing import Optional
 from vision.tools.registry import tool
 from vision.logger import logger
+from vision.platform import (
+    lock_workstation,
+    suspend_computer,
+    empty_trash,
+    shutdown_machine,
+    restart_machine,
+    cancel_shutdown,
+)
 
 
 @tool(name="kill_process_by_name", description="Force terminate / kill an application or background process by name (e.g. chrome, notepad, discord, code, python).")
@@ -48,72 +55,43 @@ def kill_process_by_name(process_name: str) -> str:
         return f"No running processes found matching '{process_name}'."
 
 
-@tool(name="lock_workstation", description="Lock the Windows computer / lock screen immediately.")
-def lock_workstation() -> str:
-    """Locks the current Windows workstation instantly using Win32 API."""
+@tool(name="lock_workstation", description="Lock the computer / lock screen immediately.")
+def lock_workstation_tool() -> str:
+    """Locks the current workstation instantly."""
     logger.info("[PowerTool] Locking workstation...")
-    try:
-        import ctypes
-        ctypes.windll.user32.LockWorkStation()
-        return "Workstation is now locked."
-    except Exception as e:
-        logger.error(f"[PowerTool] Failed to lock workstation: {e}")
-        return f"Failed to lock workstation: {e}"
+    return lock_workstation()
 
 
-@tool(name="sleep_pc", description="Put the Windows computer into sleep mode.")
+@tool(name="sleep_pc", description="Put the computer into sleep mode.")
 def sleep_pc() -> str:
-    """Puts Windows into sleep mode."""
+    """Puts the computer to sleep."""
     logger.info("[PowerTool] Putting PC to sleep...")
-    try:
-        subprocess.run(["powershell", "-Command", "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $false, $false)"], check=False)
-        return "Putting computer to sleep."
-    except Exception as e:
-        return f"Failed to sleep computer: {e}"
+    return suspend_computer()
 
 
-@tool(name="empty_recycle_bin", description="Empty the Windows Recycle Bin to free up disk space.")
-def empty_recycle_bin() -> str:
-    """Empties the Windows Recycle Bin silently using native Win32 API."""
+@tool(name="empty_recycle_bin", description="Empty the Recycle Bin / Trash to free up disk space.")
+def empty_recycle_bin_tool() -> str:
+    """Empties the recycle bin / trash silently."""
     logger.info("[PowerTool] Emptying Recycle Bin...")
-    try:
-        import ctypes
-        # Flags: 7 = SHERB_NOCONFIRMATION (1) | SHERB_NOPROGRESSUI (2) | SHERB_NOSOUND (4)
-        ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, 7)
-        return "Recycle Bin is now empty."
-    except Exception as e:
-        logger.error(f"[PowerTool] Failed to empty Recycle Bin: {e}")
-        return "Recycle Bin is now empty."
+    return empty_trash()
 
 
 @tool(name="shutdown_pc", description="Schedule a computer shutdown with a 15-second safety timer (can be cancelled).")
 def shutdown_pc(timer_seconds: int = 15) -> str:
-    """Schedules a safe Windows shutdown."""
+    """Schedules a safe shutdown."""
     logger.warning(f"[PowerTool] Scheduling shutdown in {timer_seconds}s...")
-    try:
-        subprocess.run(["shutdown", "/s", "/t", str(timer_seconds), "/c", "VISION AI OS initiated shutdown."], check=True)
-        return f"Shutdown scheduled in {timer_seconds} seconds. Say 'Cancel shutdown' if you want to abort."
-    except Exception as e:
-        return f"Failed to schedule shutdown: {e}"
+    return shutdown_machine(timer_seconds)
 
 
-@tool(name="restart_pc", description="Schedule a computer restart with a 15-second safety timer.")
+@tool(name="restart_pc", description="Schedule a computer restart with a 15-second safety timer (can be cancelled).")
 def restart_pc(timer_seconds: int = 15) -> str:
-    """Schedules a safe Windows restart."""
+    """Schedules a safe restart."""
     logger.warning(f"[PowerTool] Scheduling restart in {timer_seconds}s...")
-    try:
-        subprocess.run(["shutdown", "/r", "/t", str(timer_seconds), "/c", "VISION AI OS initiated restart."], check=True)
-        return f"Restart scheduled in {timer_seconds} seconds. Say 'Cancel shutdown' if you want to abort."
-    except Exception as e:
-        return f"Failed to schedule restart: {e}"
+    return restart_machine(timer_seconds)
 
 
 @tool(name="cancel_shutdown", description="Cancel a pending scheduled computer shutdown or restart.")
-def cancel_shutdown() -> str:
+def cancel_shutdown_tool() -> str:
     """Cancels any pending shutdown or restart."""
     logger.info("[PowerTool] Aborting scheduled shutdown/restart...")
-    try:
-        subprocess.run(["shutdown", "/a"], check=True)
-        return "Scheduled shutdown or restart has been cancelled."
-    except Exception as e:
-        return f"No scheduled shutdown to cancel (or error: {e})."
+    return cancel_shutdown()

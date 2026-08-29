@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any
 from vision.tools.registry import tool
 from vision.config import config
 from vision.logger import logger
+from vision.platform import open_terminal
 
 try:
     import paramiko
@@ -141,11 +142,11 @@ def open_parking_logs_terminal(lines: int = 50, host: Optional[str] = None) -> s
     target_user = config.UBUNTU_SERVER_USER
     password = config.UBUNTU_SERVER_PASSWORD
 
-    ssh_cmd = f'start cmd.exe /k "title KPR Parking Print Server ({target_host}) && ssh {target_user}@{target_host}"'
-    logger.info(f"[RemoteServer] Launching live SSH parking log terminal: '{ssh_cmd}'...")
+    ssh_cmd = f"title KPR Parking Print Server ({target_host}) && ssh {target_user}@{target_host}"
+    logger.info(f"[RemoteServer] Launching live SSH parking log terminal...")
 
     try:
-        subprocess.Popen(ssh_cmd, shell=True)
+        ok, msg = open_terminal(ssh_cmd)
         time.sleep(1.8)
 
         if pyautogui and password:
@@ -162,7 +163,7 @@ def open_parking_logs_terminal(lines: int = 50, host: Optional[str] = None) -> s
             pyautogui.press("enter")
             logger.info(f"[RemoteServer] Live parking log stream started in terminal for {target_user}@{target_host}")
 
-        return f"Opened live SSH terminal window connected to {target_host} and streaming kpr_print.log."
+        return f"Opened live SSH terminal window connected to {target_host} and streaming kpr_print.log." if ok else f"Opened terminal: {msg}"
     except Exception as e:
         logger.error(f"[RemoteServer] Failed to open live log terminal: {e}")
         return f"Failed to open live log terminal: {e}"
@@ -259,11 +260,11 @@ def open_interactive_ssh_terminal(host: Optional[str] = None, username: Optional
     target_user = username or config.UBUNTU_SERVER_USER
     password = config.UBUNTU_SERVER_PASSWORD
 
-    ssh_cmd = f'start cmd.exe /k "title Ubuntu Server ({target_user}@{target_host}) && ssh {target_user}@{target_host}"'
-    logger.info(f"[RemoteServer] Launching interactive SSH session: '{ssh_cmd}'...")
+    ssh_cmd = f"title Ubuntu Server ({target_user}@{target_host}) && ssh {target_user}@{target_host}"
+    logger.info(f"[RemoteServer] Launching interactive SSH session...")
 
     try:
-        subprocess.Popen(ssh_cmd, shell=True)
+        ok, msg = open_terminal(ssh_cmd)
         time.sleep(1.8)
 
         if pyautogui and password:
@@ -277,7 +278,7 @@ def open_interactive_ssh_terminal(host: Optional[str] = None, username: Optional
                 pyautogui.press("enter")
             logger.info(f"[RemoteServer] Authenticated interactive SSH to {target_user}@{target_host}")
 
-        return f"Opened interactive CMD terminal connected to Ubuntu server ({target_user}@{target_host})."
+        return f"Opened interactive terminal connected to Ubuntu server ({target_user}@{target_host})." if ok else f"Opened terminal: {msg}"
     except Exception as e:
         logger.error(f"[RemoteServer] Interactive SSH failed: {e}")
         return f"Failed to open interactive SSH terminal: {e}"

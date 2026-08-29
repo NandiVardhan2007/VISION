@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from vision.logger import logger
 from vision.config import config
+from vision.platform import play_chime
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "reminders.db")
 
@@ -250,15 +251,12 @@ class ReminderManager:
 
                     # 1. Play alert chime (in executor to avoid blocking event loop)
                     try:
-                        import winsound
                         loop = asyncio.get_running_loop()
                         def _play_chime():
-                            winsound.Beep(1046, 120)  # C6
-                            import time as _time
-                            _time.sleep(0.05)
-                            winsound.Beep(1318, 120)  # E6
-                            _time.sleep(0.05)
-                            winsound.Beep(1568, 250)  # G6
+                            play_chime(
+                                frequencies=[1046, 1318, 1568],
+                                durations_ms=[120, 120, 250],
+                            )
                         await loop.run_in_executor(None, _play_chime)
                     except Exception:
                         pass

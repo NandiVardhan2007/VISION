@@ -7,11 +7,14 @@ including specific page or page-range printing (e.g. page 5, pages 1-3).
 
 import os
 import time
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 from vision.tools.registry import tool
 from vision.memory.working_memory import working_memory
 from vision.logger import logger
+from vision.platform import IS_WINDOWS
 
 try:
     import win32print
@@ -36,33 +39,59 @@ except ImportError:
 
 
 def check_printer_available(printer_name: Optional[str] = None) -> Dict[str, Any]:
-    """Check if the specified or default printer is installed and accessible."""
-    if not win32print:
-        return {"available": False, "name": None, "error": "win32print module is not available."}
+    """Check if a printer is installed and accessible on the current OS."""
+    # Windows: use Win32 GDI.
+    if IS_WINDOWS and win32print:
+        try:
+            target_printer = printer_name or win32print.GetDefaultPrinter()
+            if not target_printer:
+                return {"available": False, "name": None, "error": "No printer detected or configured on this computer."}
 
-    try:
-        target_printer = printer_name or win32print.GetDefaultPrinter()
-        if not target_printer:
-            return {"available": False, "name": None, "error": "No printer detected or configured on this computer."}
+            hprinter = win32print.OpenPrinter(target_printer)
+            p_info = win32print.GetPrinter(hprinter, 2)
+            win32print.ClosePrinter(hprinter)
 
-        # Check printer attributes via Windows handle
-        hprinter = win32print.OpenPrinter(target_printer)
-        p_info = win32print.GetPrinter(hprinter, 2)
-        win32print.ClosePrinter(hprinter)
+            status = p_info.get("Status", 0)
+            if status & 0x00000080:  # PRINTER_STATUS_OFFLINE
+                return {
+                    "available": False,
+                    "name": target_printer,
+                    "error": f"The printer '{target_printer}' is currently OFFLINE. Please check power and USB/network cables.",
+                }
+            return {"available": True, "name": target_printer, "error": None}
+        except Exception as e:
+            logger.warning(f"[PrinterTool] Failed to verify printer: {e}")
+            return {"available": False, "name": None, "error": f"Printer is not connected or accessible ({e})."}
 
-        status = p_info.get("Status", 0)
-        # Check offline bit flag (PRINTER_STATUS_OFFLINE = 0x00000080)
-        if status & 0x00000080:
-            return {
-                "available": False,
-                "name": target_printer,
-                "error": f"The printer '{target_printer}' is currently OFFLINE. Please check power and USB/network cables."
-            }
+    # Linux / macOS: prefer CUPS `lpstat` / `lp`, fall back to `lpr`.
+    if shutil.which("lpstat") or shutil.which("lp") or shutil.which("lpr"):
+        try:
+            if printer_name:
+                target = printer_name
+            elif shutil.which("lpstat"):
+                out = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, errors="ignore", timeout=5)
+                target = None
+                for line in out.stdout.splitlines():
+                    if line.startswith("system default destination:"):
+                        target = line.split(":", 1)[1].strip()
+                        break
+                if not target:
+                    # List first available printer
+                    out2 = subprocess.run(["lpstat", "-p"], capture_output=True, text=True, errors="ignore", timeout=5)
+                    for line in out2.stdout.splitlines():
+                        if line.startswith("printer"):
+                            target = line.split()[1]
+                            break
+            else:
+                target = printer_name
+            if target:
+                return {"available": True, "name": target, "error": None}
+            return {"available": True, "name": "default", "error": None}
+        except Exception as e:
+            logger.warning(f"[PrinterTool] Failed to verify printer: {e}")
+            return {"available": False, "name": None, "error": f"Printer check failed ({e})."}
 
-        return {"available": True, "name": target_printer, "error": None}
-    except Exception as e:
-        logger.warning(f"[PrinterTool] Failed to verify printer: {e}")
-        return {"available": False, "name": None, "error": f"Printer is not connected or accessible ({e})."}
+    return {"available": False, "name": None, "error": "No printer subsystem available (install CUPS / a PDF viewer with print support)."}
 
 
 def _parse_page_selection(pages_str: Optional[Union[str, int]], total_pages: int) -> List[int]:
@@ -135,6 +164,45 @@ def create_bordered_a4_document(margin_cm: float = 1.5, file_name: str = "border
         return f"Error creating bordered document: {e}"
 
 
+# ── POSIX (Linux/macOS) print path via CUPS ────────────────────────
+
+def _print_pdf_posix(pdf_path: Path, printer_name: Optional[str], copies: int = 1, page_selection: Optional[Union[str, int]] = None) -> bool:
+    """Send a PDF to a CUPS/lpr printer using `lp` (preferred) or `lpr`."""
+    sender = shutil.which("lp") or shutil.which("lpr")
+    if not sender:
+        return False
+    pages_arg: List[str] = []
+    if page_selection is not None:
+        sel = str(page_selection)
+        # Convert "1-3" -> "1-3" (CUPS already understands ranges) but strip
+        # verbose words like "page" just in case.
+        sel = sel.replace("page", "").replace("Page", "").strip()
+        if sel:
+            pages_arg = ["-P", sel] if sender.endswith("lp") else ["-o", f"page-ranges={sel}"]
+    cmd = [sender]
+    if printer_name and printer_name != "default":
+        cmd += (["-d", printer_name] if sender.endswith("lp") else ["-P", printer_name])
+    cmd += pages_arg
+    for _ in range(max(1, copies)):
+        cmd_c = cmd + [str(pdf_path)]
+        try:
+            subprocess.run(cmd_c, check=False, capture_output=True, text=True, errors="ignore")
+        except Exception as e:
+            logger.warning(f"[PrinterTool] POSIX print error: {e}")
+            return False
+    return True
+
+
+def _print_pdf_cross_platform(pdf_path: Path, printer_name: str, copies: int = 1, page_selection: Optional[Union[str, int]] = None) -> bool:
+    """Dispatch a print job using the best available backend for the OS."""
+    if IS_WINDOWS and pymupdf and win32ui and win32print:
+        return _print_pdf_direct_gdi(pdf_path, printer_name, copies=copies, page_selection=page_selection)
+    if shutil.which("lp") or shutil.which("lpr"):
+        return _print_pdf_posix(pdf_path, printer_name, copies=copies, page_selection=page_selection)
+    # No GDI and no CUPS — cannot actually print, but report honestly.
+    return False
+
+
 def _print_pdf_direct_gdi(pdf_path: Path, printer_name: str, copies: int = 1, page_selection: Optional[Union[str, int]] = None) -> bool:
     """Render selected PDF pages and send direct GDI raster print jobs to the Windows printer DC."""
     if not pymupdf or not win32ui or not win32print:
@@ -202,11 +270,11 @@ def print_document(file_path: str, copies: int = 1, pages: Optional[Union[str, i
     page_desc = f"page {selected_page}" if selected_page else "all pages"
     logger.info(f"[PrinterTool] Printing {copies} copies of '{p.name}' ({page_desc}) to '{target_printer}' via Direct GDI")
 
-    # 2. Dispatch print job using Direct GDI rendering
+    # 2. Dispatch print job using the best available backend for this OS
     try:
-        success = _print_pdf_direct_gdi(p, target_printer, copies=copies, page_selection=selected_page)
+        success = _print_pdf_cross_platform(p, target_printer, copies=copies, page_selection=selected_page)
         if not success:
-            return f"Error: GDI print driver unavailable for '{target_printer}'."
+            return f"Error: no usable print backend available for '{target_printer}' on this OS."
 
         working_memory.record_file(str(p))
         return f"Successfully sent {copies} {'copy' if copies == 1 else 'copies'} of '{p.name}' ({page_desc}) directly to printer '{target_printer}'."

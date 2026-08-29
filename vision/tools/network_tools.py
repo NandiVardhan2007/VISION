@@ -10,6 +10,7 @@ import shutil
 from typing import Optional
 from vision.tools.registry import tool
 from vision.logger import logger
+from vision.platform import ping_host as ping_host_platform, get_wifi_diagnostics
 
 
 @tool(name="test_internet_speed", description="Test live internet download/upload speed, ping latency, and ISP information using Ookla Speedtest.")
@@ -87,41 +88,14 @@ def get_network_diagnostics() -> str:
     local IP, default gateway, and DNS ping status.
     """
     lines = ["Network & Wi-Fi Diagnostics:"]
-    
-    # 1. Wi-Fi interface details
-    try:
-        wifi_output = subprocess.check_output("netsh wlan show interfaces", shell=True, text=True, errors="ignore")
-        ssid, bssid, signal, radio, rx_rate, tx_rate, state = None, None, None, None, None, None, None
-        
-        for line in wifi_output.splitlines():
-            line = line.strip()
-            if line.startswith("SSID") and not line.startswith("BSSID"):
-                ssid = line.split(":", 1)[1].strip()
-            elif line.startswith("BSSID"):
-                bssid = line.split(":", 1)[1].strip()
-            elif line.startswith("Signal"):
-                signal = line.split(":", 1)[1].strip()
-            elif line.startswith("Radio type"):
-                radio = line.split(":", 1)[1].strip()
-            elif line.startswith("Receive rate"):
-                rx_rate = line.split(":", 1)[1].strip()
-            elif line.startswith("Transmit rate"):
-                tx_rate = line.split(":", 1)[1].strip()
-            elif line.startswith("State"):
-                state = line.split(":", 1)[1].strip()
 
-        if ssid:
-            lines.append(f"• Wi-Fi SSID: {ssid} (State: {state or 'connected'})")
-            if signal:
-                lines.append(f"• Signal Quality: {signal}")
-            if radio:
-                lines.append(f"• Protocol: {radio}")
-            if rx_rate and tx_rate:
-                lines.append(f"• Link Rate: Rx {rx_rate} Mbps / Tx {tx_rate} Mbps")
-        else:
-            lines.append("• Wi-Fi: No active Wi-Fi interface connected (or connected via Ethernet).")
+    # 1. Wi-Fi interface details (platform-aware)
+    try:
+        wifi_lines = get_wifi_diagnostics()
+        if wifi_lines:
+            lines.extend(wifi_lines)
     except Exception as e:
-        logger.debug(f"[NetworkTool] netsh wlan check: {e}")
+        logger.debug(f"[NetworkTool] wifi diagnostics: {e}")
 
     # 2. Local IP & Hostname
     try:
@@ -132,14 +106,17 @@ def get_network_diagnostics() -> str:
     except Exception as e:
         logger.debug(f"[NetworkTool] Local IP check: {e}")
 
-    # 3. Quick DNS Ping to 8.8.8.8 (Google) and 1.1.1.1 (Cloudflare)
+    # 3. Connectivity ping to public DNS
     try:
-        ping_out = subprocess.check_output("ping -n 2 8.8.8.8", shell=True, text=True, errors="ignore")
-        if "Average =" in ping_out:
-            avg_ping = ping_out.split("Average =")[-1].strip()
-            lines.append(f"• Internet Connectivity: Online (DNS Latency: {avg_ping})")
+        res = ping_host("8.8.8.8", count=2)
+        if res.get("online"):
+            avg = res.get("avg", "")
+            if avg and avg != "Unknown":
+                lines.append(f"• Internet Connectivity: Online (DNS Latency: {avg})")
+            else:
+                lines.append("• Internet Connectivity: Online")
         else:
-            lines.append("• Internet Connectivity: Online")
+            lines.append("• Internet Connectivity: Offline or Ping unreachable")
     except Exception:
         lines.append("• Internet Connectivity: Offline or Ping unreachable")
 
@@ -150,21 +127,10 @@ def get_network_diagnostics() -> str:
 def ping_host(host: str = "google.com", count: int = 4) -> str:
     """Pings a target host and returns packet loss and average latency."""
     clean_host = host.strip().replace("http://", "").replace("https://", "").split("/")[0]
-    count = max(1, min(10, int(count)))
-    
     try:
-        cmd = f"ping -n {count} {clean_host}"
-        output = subprocess.check_output(cmd, shell=True, text=True, errors="ignore")
-        
-        # Parse loss & avg latency
-        loss = "0%"
-        avg = "Unknown"
-        for line in output.splitlines():
-            if "Lost =" in line:
-                loss = line.split("(")[-1].split(")")[0].strip()
-            if "Average =" in line:
-                avg = line.split("Average =")[-1].strip()
-
+        res = ping_host_platform(clean_host, count=count)
+        loss = res.get("loss", "0%")
+        avg = res.get("avg", "Unknown")
         return f"Ping results for '{clean_host}':\n• Packet Loss: {loss}\n• Average Latency: {avg}"
     except Exception as e:
         return f"Failed to ping '{clean_host}': {e}"

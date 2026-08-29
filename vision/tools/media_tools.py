@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 from vision.tools.registry import tool
 from vision.logger import logger
+from vision.platform import open_path, open_url, IS_WINDOWS, IS_MACOS
 
 try:
     import pyautogui
@@ -23,17 +24,31 @@ except ImportError:
 
 def _get_comet_browser_path() -> Optional[str]:
     """Locate the Comet browser executable or taskbar shortcut on the system."""
-    candidates = [
-        r"C:\Program Files\Perplexity\Comet\Application\comet.exe",
-        r"C:\Program Files (x86)\Perplexity\Comet\Application\comet.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Perplexity\Comet\Application\comet.exe"),
-        os.path.expandvars(r"%APPDATA%\Microsoft\Internet Explorer\Quick Launch\Comet.lnk"),
-        os.path.expandvars(r"%APPDATA%\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\YouTube.lnk"),
-        os.path.expandvars(r"%APPDATA%\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Comet.lnk"),
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
+    if IS_WINDOWS:
+        candidates = [
+            r"C:\Program Files\Perplexity\Comet\Application\comet.exe",
+            r"C:\Program Files (x86)\Perplexity\Comet\Application\comet.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Perplexity\Comet\Application\comet.exe"),
+            os.path.expandvars(r"%APPDATA%\Microsoft\Internet Explorer\Quick Launch\Comet.lnk"),
+            os.path.expandvars(r"%APPDATA%\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\YouTube.lnk"),
+            os.path.expandvars(r"%APPDATA%\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Comet.lnk"),
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+    elif IS_MACOS:
+        mac_path = "/Applications/Comet.app"
+        if os.path.exists(mac_path):
+            return mac_path
+    else:
+        # Linux: Comet may be under ~/.local or /opt; fall back to xdg-settings default.
+        for p in (
+            os.path.expanduser("~/.local/bin/comet"),
+            "/opt/Perplexity/Comet/comet",
+            "/usr/bin/comet",
+        ):
+            if os.path.exists(p):
+                return p
     return None
 
 
@@ -49,11 +64,13 @@ def _open_url_in_comet_or_browser(url: str) -> bool:
             elif comet_path.lower().endswith(".lnk"):
                 # Open shortcut or pass URL
                 try:
-                    subprocess.Popen([comet_path, url])
+                    ok, _msg = open_path(comet_path)
+                    if ok:
+                        return True
+                    time.sleep(1.0)
+                    webbrowser.open(url)
                     return True
                 except Exception:
-                    os.startfile(comet_path)
-                    time.sleep(1.0)
                     webbrowser.open(url)
                     return True
         except Exception as e:

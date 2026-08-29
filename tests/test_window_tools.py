@@ -8,6 +8,13 @@ from vision.tools.window_tools import (
     close_application
 )
 from vision.tools.registry import tool_registry
+import pytest
+
+try:
+    import pyautogui  # noqa: F401
+    _AUTOGUI_AVAILABLE = True
+except ImportError:
+    _AUTOGUI_AVAILABLE = False
 
 
 def test_window_tools_registered():
@@ -22,6 +29,8 @@ def test_window_tools_registered():
 
 
 def test_window_tool_actions():
+    if not _AUTOGUI_AVAILABLE:
+        pytest.skip("pyautogui not available on this OS.")
     snap_res = snap_window("left")
     assert "left" in snap_res.lower()
 

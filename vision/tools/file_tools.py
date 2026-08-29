@@ -11,6 +11,7 @@ from typing import List, Dict, Optional, Union
 from vision.tools.registry import tool
 from vision.memory.working_memory import working_memory
 from vision.logger import logger
+from vision.platform import open_path
 
 # Category definitions for smart organization
 FILE_CATEGORIES: Dict[str, List[str]] = {
@@ -223,10 +224,10 @@ def open_file(file_path: str) -> str:
         return f"Error: File or folder '{p}' does not exist."
 
     try:
-        os.startfile(str(p))
+        ok, msg = open_path(str(p))
         working_memory.record_file(str(p))
         logger.info(f"[FileTool] Opened file: {p}")
-        return f"Successfully opened '{p.name}' ({p})."
+        return f"Successfully opened '{p.name}' ({p})." if ok else f"Failed to open '{p}': {msg}"
     except Exception as e:
         return f"Failed to open '{p}': {e}"
 

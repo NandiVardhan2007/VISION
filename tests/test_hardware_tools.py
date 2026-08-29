@@ -7,9 +7,25 @@ from vision.tools.hardware_tools import (
     mute_volume, unmute_volume, get_volume_status,
     get_brightness_status, set_brightness, increase_brightness, decrease_brightness
 )
+from vision.platform import IS_WINDOWS
+import pytest
 
 
-def test_volume_controls():
+def _audio_available():
+    try:
+        from vision.tools.hardware_tools import _get_audio_endpoint
+        return _get_audio_endpoint() is not None
+    except Exception:
+        return False
+
+
+@pytest.fixture
+def requires_audio():
+    if not _audio_available():
+        pytest.skip("System audio backend (pycaw / Windows audio) not available on this OS.")
+
+
+def test_volume_controls(requires_audio):
     # Test get volume status
     status = get_volume_status()
     assert "Master Volume" in status
@@ -32,6 +48,11 @@ def test_volume_controls():
 
 
 def test_brightness_controls():
+    # Brightness control only exists where screen_brightness_control is available.
+    try:
+        import screen_brightness_control as sbc  # noqa: F401
+    except ImportError:
+        pytest.skip("screen_brightness_control not available on this OS.")
     # Test get brightness status
     b_status = get_brightness_status()
     assert "Brightness" in b_status or "Error" in b_status

@@ -4,7 +4,6 @@ Handles Windows UWP apps, protocol handlers, Start Menu search, system metrics, 
 """
 
 import os
-import subprocess
 from datetime import datetime
 from typing import Optional
 from pathlib import Path
@@ -12,6 +11,12 @@ from vision.tools.registry import tool
 from vision.perception.vision.screen import screen_capture
 from vision.perception.vision.gemini_vision import gemini_vision
 from vision.logger import logger
+from vision.platform import (
+    IS_WINDOWS,
+    launch_target,
+    find_desktop_app,
+    open_path,
+)
 
 try:
     import psutil
@@ -69,6 +74,9 @@ APP_PROTOCOL_MAP = {
 
 def _find_in_start_menu(app_name: str) -> Optional[Path]:
     """Search for matching .lnk shortcut in Windows Start Menu directories."""
+    if not IS_WINDOWS:
+        # On Linux/macOS use the cross-platform .desktop / Applications scan.
+        return find_desktop_app(app_name)
     app_name_lower = app_name.lower().replace(" ", "")
     search_dirs = [
         Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs",
@@ -86,45 +94,53 @@ def _find_in_start_menu(app_name: str) -> Optional[Path]:
     return None
 
 
-@tool(name="open_application", description="Launch an installed desktop application, Windows Store app, or open a URL.")
+@tool(name="open_application", description="Launch an installed desktop application, app-store app, or open a URL. Cross-platform: works on Windows, Linux, and macOS.")
 def open_application(app_name: str) -> str:
-    """Launch an application on Windows OS."""
+    """Launch an application on the host OS."""
     clean_name = app_name.strip().lower()
 
     # 1. Check known protocol map (e.g. WhatsApp, Spotify, Calculator, Settings)
     if clean_name in APP_PROTOCOL_MAP:
         target = APP_PROTOCOL_MAP[clean_name]
         try:
-            os.system(f'start "" "{target}"')
-            logger.info(f"[SystemTool] Launched via protocol/command: {target}")
-            return f"Successfully opened {app_name}."
+            ok, msg = launch_target(target)
+            if ok:
+                logger.info(f"[SystemTool] Launched via protocol/command: {target}")
+                return f"Successfully opened {app_name}."
+            logger.warning(f"[SystemTool] Protocol launch failed for {target}: {msg}")
         except Exception as e:
             logger.warning(f"[SystemTool] Protocol launch failed for {target}: {e}")
 
-    # 2. Check Start Menu shortcuts
+    # 2. Check Start Menu / Applications / .desktop shortcuts
     lnk_path = _find_in_start_menu(app_name)
     if lnk_path:
         try:
-            os.startfile(str(lnk_path))
-            logger.info(f"[SystemTool] Launched via Start Menu shortcut: {lnk_path}")
-            return f"Successfully opened {lnk_path.stem}."
+            ok, msg = open_path(str(lnk_path))
+            if ok:
+                logger.info(f"[SystemTool] Launched via shortcut: {lnk_path}")
+                label = getattr(lnk_path, "stem", app_name)
+                return f"Successfully opened {label}."
         except Exception as e:
-            logger.warning(f"[SystemTool] Start Menu shortcut launch failed: {e}")
+            logger.warning(f"[SystemTool] Shortcut launch failed: {e}")
 
-    # 3. Try protocol scheme (e.g. appname:)
+    # 3. Try the bare executable name / URI scheme via cross-platform launcher
     try:
-        os.system(f'start "" "{clean_name}:"')
-        logger.info(f"[SystemTool] Attempted protocol scheme: {clean_name}:")
-        return f"Attempted to launch {app_name}."
+        ok, msg = launch_target(clean_name)
+        if ok:
+            logger.info(f"[SystemTool] Attempted launch: {app_name}")
+            return f"Successfully launched {app_name}."
     except Exception:
         pass
 
-    # 4. Fallback to start command / executable
+    # 4. Fallback to launching the raw command
     try:
-        subprocess.Popen(f'start "" "{app_name}"', shell=True)
-        return f"Successfully launched {app_name}."
-    except Exception as e:
-        return f"Failed to launch {app_name}: {e}"
+        from vision.platform import launch_application_command
+        ok, msg = launch_application_command(app_name)
+        if ok:
+            return f"Successfully launched {app_name}."
+    except Exception:
+        pass
+    return f"Could not find or launch '{app_name}' on this system."
 
 
 @tool(name="get_current_time_and_date", description="Get the exact current local system time, day of the week, and date.")

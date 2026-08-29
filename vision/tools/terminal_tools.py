@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from vision.tools.registry import tool
 from vision.logger import logger
+from vision.platform import open_terminal, IS_WINDOWS
 
 try:
     import pyautogui
@@ -65,16 +66,28 @@ def execute_terminal_command(command: str, working_directory: Optional[str] = No
     start_time = time.time()
 
     try:
-        # Run via PowerShell for full Windows command suite
-        process = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=t_sec,
-            encoding="utf-8",
-            errors="replace"
-        )
+        # Run through PowerShell on Windows; through the default POSIX shell elsewhere.
+        if IS_WINDOWS:
+            process = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=t_sec,
+                encoding="utf-8",
+                errors="replace",
+            )
+        else:
+            process = subprocess.run(
+                command,
+                cwd=cwd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=t_sec,
+                encoding="utf-8",
+                errors="replace",
+            )
 
         elapsed = round(time.time() - start_time, 2)
         stdout = process.stdout.strip()
@@ -200,15 +213,15 @@ def _resolve_server_credentials(target: str, username_override: Optional[str] = 
 @tool(name="connect_to_ssh_server", description="Open a new visible CMD terminal and connect via SSH to a remote server (retrieves IP, username, and auth from MAG memory).")
 def connect_to_ssh_server(server_name_or_ip: str = "ubuntu", username: Optional[str] = None) -> str:
     """
-    Opens a visible CMD window, retrieves credentials from MAG memory, connects via SSH, and auto-authenticates.
+    Opens a visible terminal, retrieves credentials from MAG memory, connects via SSH, and auto-authenticates.
     """
     host, user, password = _resolve_server_credentials(server_name_or_ip, username)
 
-    ssh_cmd = f"start cmd.exe /k ssh {user}@{host}"
-    logger.info(f"[TerminalTool] Launching SSH session: '{ssh_cmd}'...")
+    ssh_cmd = f"title Ubuntu Server ({user}@{host}) && ssh {user}@{host}"
+    logger.info(f"[TerminalTool] Launching SSH session...")
 
     try:
-        subprocess.Popen(ssh_cmd, shell=True)
+        ok, msg = open_terminal(ssh_cmd)
         time.sleep(1.8)
 
         if pyautogui and password:
@@ -218,7 +231,7 @@ def connect_to_ssh_server(server_name_or_ip: str = "ubuntu", username: Optional[
             pyautogui.press("enter")
             logger.info(f"[TerminalTool] Authenticated SSH connection to {user}@{host}")
 
-        return f"Opened CMD and connected to SSH server ({user}@{host})."
+        return f"Opened terminal and connected to SSH server ({user}@{host})." if ok else f"Opened terminal: {msg}"
     except Exception as e:
         logger.error(f"[TerminalTool] SSH connection failed: {e}")
         return f"Failed to connect to SSH server: {e}"

@@ -11,6 +11,7 @@ from ctypes import wintypes
 from typing import Optional, List, Dict, Any
 from vision.tools.registry import tool
 from vision.logger import logger
+from vision.platform import IS_WINDOWS
 
 try:
     import pyautogui
@@ -150,7 +151,9 @@ def _find_target_window(app_name: str) -> Optional[int]:
     if found_hwnd:
         return found_hwnd
 
-    # 4. Fallback using ctypes GetWindow traversal
+    # 4. Fallback using ctypes GetWindow traversal (Windows only)
+    if not IS_WINDOWS:
+        return None
     try:
         user32 = ctypes.windll.user32
         hwnd = user32.GetTopWindow(0)
@@ -195,7 +198,7 @@ def _ensure_and_focus_window(app_name: str) -> bool:
         logger.info(f"[InputTool] Found existing active window HWND {hwnd} for '{target}'")
 
     # 3. Force foreground focus cleanly without leaving Alt stuck in menu bar
-    if hwnd:
+    if hwnd and IS_WINDOWS:
         try:
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
@@ -231,6 +234,11 @@ def _ensure_and_focus_window(app_name: str) -> bool:
         except Exception as e:
             logger.debug(f"[InputTool] Focus window error: {e}")
             return True
+    elif hwnd:
+        # Non-Windows: we located a window but cannot force-foreground without a
+        # platform window API; pyautogui/keyboard actions below still operate on focus.
+        logger.info(f"[InputTool] Found window handle for '{target}' (focus not enforced on this OS).")
+        return True
 
     return False
 

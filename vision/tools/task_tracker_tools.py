@@ -10,6 +10,7 @@ from vision.tools.registry import tool
 from vision.memory.task_tracker_db import task_db
 from vision.tools.excel_tracker_engine import excel_tracker
 from vision.logger import logger
+from vision.platform import open_path
 
 
 @tool(
@@ -151,10 +152,12 @@ def open_excel_tracker() -> str:
             # File is already open in Excel, just proceed to open/focus it
             pass
         if os.path.exists(path):
-            os.startfile(path)
-            return f"Opening '{os.path.basename(path)}' in Excel..."
-        os.startfile(str(path))
-        return f"Opening Task Tracker Excel spreadsheet '{path}' on your screen."
+            ok, msg = open_path(path)
+            if ok:
+                return f"Opening '{os.path.basename(path)}' in your spreadsheet app..."
+            return f"Failed to open '{os.path.basename(path)}': {msg}"
+        ok, msg = open_path(str(path))
+        return f"Opening Task Tracker spreadsheet '{path}' on your screen." if ok else f"Failed to open spreadsheet: {msg}"
     except Exception as e:
         logger.error(f"[TaskTrackerTool] Error opening excel tracker: {e}")
         return f"Failed to open Excel tracker: {str(e)}"
