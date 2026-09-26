@@ -7,6 +7,7 @@ import io
 import os
 import asyncio
 import tempfile
+import threading
 import time
 from typing import Optional
 from vision.perception.stt.base import BaseSTT
@@ -44,39 +45,45 @@ class LocalWhisperSTT(BaseSTT):
         self.prompt = prompt or DEFAULT_LOCAL_PROMPT
         self.model: Optional[WhisperModel] = None
         self._groq_fallback = GroqSTT()
-        self._model_loading = False
+        self._model_lock = threading.Lock()
 
     def _get_model(self) -> Optional[WhisperModel]:
-        """Lazy load local quantized neural model."""
+        """Lazy load local quantized neural model (thread-safe, one-time)."""
         if self.model is not None:
             return self.model
         if WhisperModel is None:
             logger.warning("[LocalSTT] faster-whisper not installed. Falling back to Groq Cloud STT.")
             return None
 
-        try:
-            logger.info(f"[LocalSTT] Loading local neural model '{self.model_size}' (Device: {self.device}, Compute: {self.compute_type}, Threads: {self.cpu_threads})...")
-            t0 = time.time()
-            self.model = WhisperModel(
-                model_size_or_path=self.model_size,
-                device=self.device,
-                compute_type=self.compute_type,
-                cpu_threads=self.cpu_threads,
-                num_workers=2
-            )
-            load_ms = round((time.time() - t0) * 1000, 1)
-            logger.info(f"[LocalSTT] Local Faster-Whisper model ready in {load_ms}ms (Sub-50ms Offline ASR active).")
-            return self.model
-        except Exception as e:
-            logger.warning(f"[LocalSTT] Could not load local WhisperModel ({e}). Using Groq Cloud STT as fallback.")
-            self.model = None
-            return None
+        with self._model_lock:
+            # Re-check inside the lock in case another worker thread just loaded it.
+            if self.model is not None:
+                return self.model
+            try:
+                logger.info(f"[LocalSTT] Loading local neural model '{self.model_size}' (Device: {self.device}, Compute: {self.compute_type}, Threads: {self.cpu_threads})...")
+                t0 = time.time()
+                self.model = WhisperModel(
+                    model_size_or_path=self.model_size,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                    cpu_threads=self.cpu_threads,
+                    num_workers=2
+                )
+                load_ms = round((time.time() - t0) * 1000, 1)
+                logger.info(f"[LocalSTT] Local Faster-Whisper model ready in {load_ms}ms (Sub-50ms Offline ASR active).")
+                return self.model
+            except Exception as e:
+                logger.warning(f"[LocalSTT] Could not load local WhisperModel ({e}). Using Groq Cloud STT as fallback.")
+                self.model = None
+                return None
 
     def _transcribe_sync(self, audio_data: bytes, language: str = "en", filename: str = None, prompt: str = None) -> str:
         """Synchronous transcription execution inside worker thread."""
         model = self._get_model()
         if model is None:
-            return ""
+            # Signal unavailability so the async caller falls back to Groq Cloud STT
+            # instead of silently returning an empty transcription.
+            raise RuntimeError("Local Whisper model unavailable")
 
         # Write to temporary file for robust container decoding (WebM, WAV, OGG, MP3)
         temp_path = None
@@ -129,8 +136,8 @@ class LocalWhisperSTT(BaseSTT):
 
         t0 = time.time()
 
-        # 1. Primary: Local CTranslate2 Fast Neural Engine
-        if self.model is not None:
+        # 1. Primary: Local CTranslate2 Fast Neural Engine (lazy-loads on first use)
+        if WhisperModel is not None:
             try:
                 text = await asyncio.to_thread(self._transcribe_sync, audio_data, language, filename, prompt)
                 duration_ms = round((time.time() - t0) * 1000, 1)

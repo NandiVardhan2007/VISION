@@ -10,7 +10,7 @@ import shutil
 from typing import Optional
 from vision.tools.registry import tool
 from vision.logger import logger
-from vision.platform import ping_host as ping_host_platform, get_wifi_diagnostics
+from vision.platform import ping_host as ping_host_platform, get_wifi_diagnostics, IS_WINDOWS
 
 
 @tool(name="test_internet_speed", description="Test live internet download/upload speed, ping latency, and ISP information using Ookla Speedtest.")
@@ -20,9 +20,9 @@ def test_internet_speed() -> str:
     ping latency (in ms), jitter, packet loss, and ISP/Server details.
     """
     speedtest_bin = shutil.which("speedtest")
-    if not speedtest_bin:
-        # Check standard paths
-        for path in ["speedtest", "C:\\Windows\\speedtest.exe", "C:\\Program Files\\speedtest\\speedtest.exe"]:
+    if not speedtest_bin and IS_WINDOWS:
+        # Windows-only install locations; shutil.which validates the full path.
+        for path in ["C:\\Windows\\speedtest.exe", "C:\\Program Files\\speedtest\\speedtest.exe"]:
             if shutil.which(path):
                 speedtest_bin = path
                 break
@@ -42,24 +42,28 @@ def test_internet_speed() -> str:
         data = json.loads(result.stdout.strip())
 
         # Extract metrics
-        ping_ms = round(data.get("ping", {}).get("latency", 0), 2)
-        jitter_ms = round(data.get("ping", {}).get("jitter", 0), 2)
-        
+        # Coalesce None→{} so an explicit null for a normally-present object
+        # (partial Ookla run) doesn't raise AttributeError and lose all metrics,
+        # and coalesce the inner scalars (which can be present-but-null) so
+        # round()/arithmetic never sees None.
+        ping_ms = round((data.get("ping") or {}).get("latency") or 0, 2)
+        jitter_ms = round((data.get("ping") or {}).get("jitter") or 0, 2)
+
         # Bytes/sec -> Mbps (bytes * 8 / 1,000,000)
-        down_bytes_sec = data.get("download", {}).get("bandwidth", 0)
-        up_bytes_sec = data.get("upload", {}).get("bandwidth", 0)
-        
+        down_bytes_sec = (data.get("download") or {}).get("bandwidth") or 0
+        up_bytes_sec = (data.get("upload") or {}).get("bandwidth") or 0
+
         download_mbps = round((down_bytes_sec * 8) / 1_000_000, 2)
         upload_mbps = round((up_bytes_sec * 8) / 1_000_000, 2)
-        
-        isp = data.get("isp", "Unknown ISP")
-        server_info = data.get("server", {})
-        server_name = server_info.get("name", "Unknown Server")
-        server_loc = server_info.get("location", "")
-        server_country = server_info.get("country", "")
-        packet_loss = data.get("packetLoss", 0)
-        client_ip = data.get("interface", {}).get("externalIp", "")
-        result_url = data.get("result", {}).get("url", "")
+
+        isp = data.get("isp") or "Unknown ISP"
+        server_info = data.get("server") or {}
+        server_name = server_info.get("name") or "Unknown Server"
+        server_loc = server_info.get("location") or ""
+        server_country = server_info.get("country") or ""
+        packet_loss = data.get("packetLoss") or 0
+        client_ip = (data.get("interface") or {}).get("externalIp") or ""
+        result_url = (data.get("result") or {}).get("url") or ""
 
         summary = (
             f"Internet Speed Test Results:\n"
@@ -97,18 +101,20 @@ def get_network_diagnostics() -> str:
     except Exception as e:
         logger.debug(f"[NetworkTool] wifi diagnostics: {e}")
 
-    # 2. Local IP & Hostname
-    try:
-        hostname = socket.gethostname()
-        local_ip = socket.gethostbyname(hostname)
-        lines.append(f"• Hostname: {hostname}")
-        lines.append(f"• Local IPv4: {local_ip}")
-    except Exception as e:
-        logger.debug(f"[NetworkTool] Local IP check: {e}")
+    # 2. Local IP & Hostname — only if the platform wifi block didn't already
+    #    add them (get_wifi_diagnostics appends these on POSIX), to avoid dupes.
+    if not any("Hostname:" in ln for ln in lines):
+        try:
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+            lines.append(f"• Hostname: {hostname}")
+            lines.append(f"• Local IPv4: {local_ip}")
+        except Exception as e:
+            logger.debug(f"[NetworkTool] Local IP check: {e}")
 
     # 3. Connectivity ping to public DNS
     try:
-        res = ping_host("8.8.8.8", count=2)
+        res = ping_host_platform("8.8.8.8", count=2)
         if res.get("online"):
             avg = res.get("avg", "")
             if avg and avg != "Unknown":

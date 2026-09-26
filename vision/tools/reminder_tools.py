@@ -21,12 +21,16 @@ def set_voice_reminder(
     if not reminder_text:
         return "Error: Reminder message text is required."
 
-    res = reminder_manager.add_reminder(
-        message=reminder_text,
-        delay_minutes=delay_minutes,
-        time_str=time_str,
-        reminder_type="reminder"
-    )
+    try:
+        res = reminder_manager.add_reminder(
+            message=reminder_text,
+            delay_minutes=delay_minutes,
+            time_str=time_str,
+            reminder_type="reminder"
+        )
+    except Exception as e:
+        logger.error(f"[ReminderTool] Failed to schedule reminder: {e}")
+        return f"Failed to schedule reminder: {e}"
 
     return (
         f"Reminder scheduled successfully!\n"
@@ -44,20 +48,24 @@ def set_timer(
 ) -> str:
     """Sets a countdown timer that will chime and speak when elapsed."""
     total_secs = 0
-    if duration_seconds:
+    if duration_seconds is not None:
         total_secs += int(duration_seconds)
-    if duration_minutes:
+    if duration_minutes is not None:
         total_secs += int(duration_minutes * 60)
 
     if total_secs <= 0:
         total_secs = 300 # Default 5 minutes
 
     label = timer_label or "Timer"
-    res = reminder_manager.add_reminder(
-        message=label,
-        delay_seconds=total_secs,
-        reminder_type="timer"
-    )
+    try:
+        res = reminder_manager.add_reminder(
+            message=label,
+            delay_seconds=total_secs,
+            reminder_type="timer"
+        )
+    except Exception as e:
+        logger.error(f"[ReminderTool] Failed to start timer: {e}")
+        return f"Failed to start timer: {e}"
 
     return f"Timer for '{res['message']}' started! It will ring in {res['countdown']} (at {res['trigger_time']})."
 

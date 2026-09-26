@@ -232,8 +232,14 @@ class IntentRouter:
         """Filter down all registered tool schemas to only the most relevant tools."""
         q_lower = user_query.lower().strip()
         
-        # 1. Pure conversational greetings / casual phrases don't need tools
-        if q_lower in CONVERSATIONAL_EXACT or (len(q_lower.split()) <= 4 and any(q_lower.startswith(g) for g in ["hi", "hello", "hey", "bye", "good morning", "how are you"])):
+        # 1. Pure conversational greetings / casual phrases don't need tools.
+        # Match on whole leading tokens, NOT startswith: "hey lock pc" / "hi mute
+        # volume" begin with a greeting word but are real commands and must keep
+        # their tools. Multi-word greetings are covered by CONVERSATIONAL_EXACT.
+        tokens = q_lower.split()
+        first_tok = tokens[0] if tokens else ""
+        _GREETING_WORDS = {"hi", "hello", "hey", "bye", "hola", "yo", "sup", "goodbye", "thanks"}
+        if q_lower in CONVERSATIONAL_EXACT or (len(tokens) <= 2 and first_tok in _GREETING_WORDS):
             logger.debug(f"[Router] Conversational query detected -> 0 tools for query: '{user_query[:35]}...'")
             return []
 
@@ -241,7 +247,12 @@ class IntentRouter:
 
         for domain, info in DOMAIN_KEYWORD_MAP.items():
             for kw in info["keywords"]:
-                if re.search(rf"\b{re.escape(kw)}\b", q_lower) or kw in q_lower:
+                kw_l = kw.lower()
+                # A trailing/leading \b next to a non-word char (e.g. "g++")
+                # can never match; only apply the boundary on alphanumeric edges.
+                left = r"\b" if kw_l[:1].isalnum() else ""
+                right = r"\b" if kw_l[-1:].isalnum() else ""
+                if re.search(rf"{left}{re.escape(kw_l)}{right}", q_lower):
                     matched_tool_names.update(info["tools"])
                     break
 

@@ -19,7 +19,10 @@ DATA_DIR = BASE_DIR / "data"
 
 try:
     from playwright.async_api import async_playwright, Playwright, Browser, BrowserContext, Page, Dialog
-except ImportError:
+except Exception:
+    # playwright imports native/driver components at import time; a broken or
+    # partial install can raise beyond ImportError. Catch broadly so importing
+    # this module (and the whole browser-tool chain) degrades gracefully.
     async_playwright = None
     Playwright = None
     Browser = None
@@ -62,6 +65,12 @@ class BrowserController:
         logger.info(f"[BrowserController] New browser tab detected.")
         if page not in self._pages:
             self._pages.append(page)
+        # Popups get their own dialog handler too, otherwise an alert()/confirm()
+        # raised on a popup tab has no listener and blocks the whole browser.
+        try:
+            page.on("dialog", lambda d: asyncio.create_task(self._on_dialog(d)))
+        except Exception as e:
+            logger.debug(f"[BrowserController] Could not attach dialog handler to popup: {e}")
         self._page = page
 
     async def ensure_page(self, headless: bool = False) -> Page:
@@ -78,41 +87,57 @@ class BrowserController:
             if self._pw is None:
                 self._pw = await async_playwright().start()
 
-            self._browser = await self._pw.chromium.launch(
-                headless=headless,
-                args=[
-                    "--start-maximized",
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-default-browser-check",
-                    "--disable-infobars",
-                    "--no-sandbox"
-                ]
-            )
+            # If context/page setup fails after launch(), the Chromium process
+            # would leak: self._browser stays set but self._page is None, so the
+            # next ensure_page() launches ANOTHER browser and orphans this one.
+            # Tear down whatever was created before re-raising.
+            try:
+                self._browser = await self._pw.chromium.launch(
+                    headless=headless,
+                    args=[
+                        "--start-maximized",
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-default-browser-check",
+                        "--disable-infobars",
+                        "--no-sandbox"
+                    ]
+                )
 
-            self._context = await self._browser.new_context(
-                viewport=None,  # Match window size
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                locale="en-US",
-                timezone_id="Asia/Kolkata",
-                permissions=["geolocation", "notifications"]
-            )
+                self._context = await self._browser.new_context(
+                    viewport=None,  # Match window size
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    locale="en-US",
+                    timezone_id="Asia/Kolkata",
+                    permissions=["geolocation", "notifications"]
+                )
 
-            # Apply stealth scripts to evade bot detection
-            await self._context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            """)
+                # Apply stealth scripts to evade bot detection
+                await self._context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    window.chrome = { runtime: {} };
+                    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                """)
 
-            # Attach multi-tab tracker
-            self._context.on("page", self._on_new_page)
+                # Attach multi-tab tracker
+                self._context.on("page", self._on_new_page)
 
-            self._page = await self._context.new_page()
-            self._page.on("dialog", lambda d: asyncio.create_task(self._on_dialog(d)))
-            self._page.set_default_timeout(15000)
-            self._pages = [self._page]
-            return self._page
+                self._page = await self._context.new_page()
+                self._page.on("dialog", lambda d: asyncio.create_task(self._on_dialog(d)))
+                self._page.set_default_timeout(15000)
+                self._pages = [self._page]
+                return self._page
+            except Exception:
+                if self._browser is not None:
+                    try:
+                        await self._browser.close()
+                    except Exception:
+                        pass
+                self._browser = None
+                self._context = None
+                self._page = None
+                self._pages = []
+                raise
 
     async def get_current_page(self) -> Optional[Page]:
         if self._page is not None and not self._page.is_closed():
@@ -132,6 +157,38 @@ class BrowserController:
             if idx:
                 self._element_cache[idx] = el
 
+    # Bare words that are genuine HTML tag selectors (as opposed to human-readable
+    # button/link text like "Login" or "Next"). Used to disambiguate resolve_target.
+    _HTML_TAGS = {
+        "a", "button", "input", "textarea", "select", "option", "div", "span",
+        "form", "img", "label", "ul", "ol", "li", "table", "tr", "td", "th",
+        "nav", "header", "footer", "section", "article", "main", "aside", "iframe",
+        "h1", "h2", "h3", "h4", "h5", "h6", "p", "body", "html", "svg", "path",
+    }
+
+    @staticmethod
+    def _escape_selector_text(text: str) -> str:
+        """Escape backslashes and double quotes so text can sit inside a :text("...") selector."""
+        return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+    @classmethod
+    def _looks_like_selector(cls, s: str) -> bool:
+        """Heuristically decide whether a target string is a CSS/Playwright/XPath selector
+        (vs. plain human-readable element text such as a button label)."""
+        if not s:
+            return True
+        if s.startswith(("#", ".", "[", "//", "*", ":", "(")):
+            return True
+        if any(tok in s for tok in (">>", "text=", "xpath=", "css=")):
+            return True
+        if any(ch in s for ch in "#.[]>=~*+"):
+            return True
+        # Multi-word strings are human text, never a CSS type selector.
+        if " " in s.strip():
+            return False
+        # A single bare word is only a selector when it names a real HTML tag.
+        return s.strip().lower() in cls._HTML_TAGS
+
     def resolve_target(self, target: str) -> str:
         """Resolve numeric element index (e.g. '1', '2') or raw selector into valid selector."""
         target_str = str(target).strip()
@@ -140,6 +197,13 @@ class BrowserController:
             if resolved:
                 logger.debug(f"[BrowserController] Resolved index [{target_str}] -> '{resolved}'")
                 return resolved
+        # Plain button/link text (advertised as supported) -> build a safe, quote-escaped
+        # text selector so labels like 'Sign In' or 'Add to cart' actually match.
+        if not self._looks_like_selector(target_str):
+            escaped = self._escape_selector_text(target_str)
+            resolved = f':text("{escaped}")'
+            logger.debug(f"[BrowserController] Treating '{target_str}' as text -> {resolved}")
+            return resolved
         return target_str
 
     async def close(self) -> str:
@@ -313,6 +377,13 @@ async def browser_press_key(key: str) -> str:
 @tool(name="browser_scroll", description="Scroll the active browser page 'up' or 'down' by a specified pixel amount, or 'top' / 'bottom'.")
 async def browser_scroll(direction: str = "down", amount: int = 500) -> str:
     """Scroll webpage up/down or to bounds."""
+    # amount is interpolated straight into page.evaluate() JS; coerce to a real
+    # int so a stringified/garbage value can't inject arbitrary script or crash.
+    try:
+        amount = int(amount)
+    except (TypeError, ValueError):
+        amount = 500
+    amount = max(0, min(amount, 100000))
     try:
         page = await controller.get_current_page()
         if not page:
@@ -533,7 +604,8 @@ async def browser_fill_form_and_login(
         # 3. Locate & Click Login / Submit Button
         submit_btn = None
         if submit_button_text:
-            btn_loc = page.locator(f'button:has-text("{submit_button_text}"), input[value*="{submit_button_text}" i], a:has-text("{submit_button_text}")').first
+            safe_text = controller._escape_selector_text(submit_button_text)
+            btn_loc = page.locator(f'button:has-text("{safe_text}"), input[value*="{safe_text}" i], a:has-text("{safe_text}")').first
             if await btn_loc.count() > 0 and await btn_loc.is_visible():
                 submit_btn = btn_loc
 
@@ -578,13 +650,17 @@ async def browser_fill_form_and_login(
 async def browser_list_tabs() -> str:
     """List open tabs."""
     try:
-        if not controller._pages:
+        # Number the SAME filtered list browser_switch_tab indexes into
+        # (open pages only). Enumerating raw _pages while skipping closed ones
+        # produced gaps ([1],[3],...) so a displayed index no longer matched the
+        # tab_index switch_tab expects.
+        active_pages = [p for p in controller._pages if not p.is_closed()]
+        if not active_pages:
             return "No open browser tabs."
         output = ["Open Browser Tabs:"]
-        for idx, p in enumerate(controller._pages, 1):
-            if not p.is_closed():
-                title = await p.title()
-                output.append(f"[{idx}] {title} | {p.url}" + (" (Active)" if p == controller._page else ""))
+        for idx, p in enumerate(active_pages, 1):
+            title = await p.title()
+            output.append(f"[{idx}] {title} | {p.url}" + (" (Active)" if p == controller._page else ""))
         return "\n".join(output)
     except Exception as e:
         return f"Error listing tabs: {e}"
@@ -697,7 +773,7 @@ Respond ONLY with a JSON object in this exact schema:
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1
             )
-            raw_content = llm_resp.get("content", "").strip()
+            raw_content = (llm_resp.get("content") or "").strip()
             
             # Extract JSON block
             json_match = re.search(r"\{.*\}", raw_content, re.DOTALL)
@@ -706,12 +782,15 @@ Respond ONLY with a JSON object in this exact schema:
                 continue
 
             action_data = json.loads(json_match.group(0))
-            action = action_data.get("action", "").lower()
-            thought = action_data.get("thought", "")
-            target = str(action_data.get("target", ""))
-            text = action_data.get("text", "")
-            press_enter = action_data.get("press_enter", False)
-            final_answer = action_data.get("final_answer", "")
+            # Guard against present-but-None JSON values (e.g. "action": null),
+            # which would make .lower()/str ops crash and be misreported as a
+            # parse error.
+            action = (action_data.get("action") or "").lower()
+            thought = action_data.get("thought") or ""
+            target = str(action_data.get("target") or "")
+            text = action_data.get("text") or ""
+            press_enter = bool(action_data.get("press_enter", False))
+            final_answer = action_data.get("final_answer") or ""
 
             logger.info(f"[BrowserAgent] Step {step}: Action={action}, Target={target}, Thought={thought}")
             history.append(f"Step {step}: {action} (Target: {target}) -> {thought}")
@@ -719,24 +798,33 @@ Respond ONLY with a JSON object in this exact schema:
             if action == "done":
                 return f"Task Completed Successfully!\n\nGoal: {goal}\n\nResult:\n{final_answer or content_sample}"
 
+            # Capture each sub-action's result string into history. Discarding it
+            # let a failed click/type/navigate look like progress and inflated the
+            # final "session finished" summary into false success; now the LLM
+            # sees the real outcome on the next step and the log is faithful.
             elif action == "click":
-                await browser_click(target)
+                result = await browser_click(target)
+                history.append(f"  ↳ click result: {result}")
                 await asyncio.sleep(2)
 
             elif action == "type":
-                await browser_type(target, text, press_enter=press_enter)
+                result = await browser_type(target, text, press_enter=press_enter)
+                history.append(f"  ↳ type result: {result}")
                 await asyncio.sleep(2)
 
             elif action == "navigate":
-                await browser_navigate(target)
+                result = await browser_navigate(target)
+                history.append(f"  ↳ navigate result: {result}")
                 await asyncio.sleep(2)
 
             elif action == "scroll":
-                await browser_scroll("down", 600)
+                result = await browser_scroll("down", 600)
+                history.append(f"  ↳ scroll result: {result}")
                 await asyncio.sleep(1)
 
             elif action == "press_key":
-                await browser_press_key(target or "Enter")
+                result = await browser_press_key(target or "Enter")
+                history.append(f"  ↳ press_key result: {result}")
                 await asyncio.sleep(2)
 
         except Exception as e:

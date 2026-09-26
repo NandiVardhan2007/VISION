@@ -25,18 +25,20 @@ def test_email_classification():
 
 
 def test_outlook_workflow():
-    # 1. Scan college emails
+    # 1. Open Outlook for review. Inbox contents are NOT fabricated — the tool
+    #    opens the mailbox and reports honestly that automated scanning needs
+    #    Graph API access to be configured.
     res = check_college_outlook_emails(account_type="college")
     assert "Google Chrome" in res or "Outlook" in res
-    assert "Important College" in res or "Promotional" in res
 
-    # 2. Get pending review state
+    # 2. With no live scan available, there is no pending review queue.
     review = get_pending_email_review()
-    assert "Current Outlook Review State" in review
+    assert "No pending email review" in review
 
-    # 3. Confirm move to bin
+    # 3. Nothing was queued, so there is nothing to move to the bin (no
+    #    fabricated deletions are ever reported).
     bin_res = confirm_move_emails_to_bin(confirmed=True)
-    assert "Recycle Bin" in bin_res or "Successfully moved" in bin_res
+    assert "no pending promotional emails" in bin_res.lower()
 
 
 def test_tool_registry_registration():

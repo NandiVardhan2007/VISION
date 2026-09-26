@@ -2,9 +2,21 @@
 Tool Registry and schema generator for OpenAI/Groq function calling.
 """
 
+import asyncio
 import inspect
-from typing import Callable, Dict, Any, List, Optional
+import functools
+from typing import Callable, Dict, Any, List, Optional, Union
 from vision.logger import logger
+
+
+def _unwrap_annotation(annotation: Any) -> Any:
+    """Reduce Optional[X] / Union[X, None] to X so type mapping and coercion see the
+    real underlying type rather than falling back to 'string'."""
+    if getattr(annotation, "__origin__", None) is Union:
+        non_none = [a for a in annotation.__args__ if a is not type(None)]
+        if len(non_none) == 1:
+            return non_none[0]
+    return annotation
 
 
 class ToolRegistry:
@@ -23,19 +35,31 @@ class ToolRegistry:
             required = []
 
             for param_name, param in sig.parameters.items():
-                if param_name in ["self", "cls"]:
+                # Skip self/cls and variadic params (*args/**kwargs) — a variadic
+                # has no meaningful scalar schema and, lacking a default, would be
+                # forced into `required`, producing an invalid schema.
+                if param_name in ["self", "cls"] or param.kind in (
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                ):
                     continue
 
                 param_type = "string"
-                if param.annotation == int:
+                annotation = _unwrap_annotation(param.annotation)
+                # Subscripted generics (List[str], Dict[str, Any], list[str], ...)
+                # have `_name is None`; only bare List/Dict set `_name`. Detect the
+                # container via `__origin__` so typed params map to array/object,
+                # not a bogus "string".
+                origin = getattr(annotation, "__origin__", None)
+                if annotation is int:
                     param_type = "integer"
-                elif param.annotation == float:
+                elif annotation is float:
                     param_type = "number"
-                elif param.annotation == bool:
+                elif annotation is bool:
                     param_type = "boolean"
-                elif param.annotation == list or getattr(param.annotation, "_name", None) == "List":
+                elif annotation is list or origin is list or getattr(annotation, "_name", None) == "List":
                     param_type = "array"
-                elif param.annotation == dict or getattr(param.annotation, "_name", None) == "Dict":
+                elif annotation is dict or origin is dict or getattr(annotation, "_name", None) == "Dict":
                     param_type = "object"
 
                 properties[param_name] = {
@@ -59,6 +83,8 @@ class ToolRegistry:
                 }
             }
 
+            if tool_name in self._tools:
+                logger.warning(f"[ToolRegistry] Duplicate tool name '{tool_name}' — overwriting previous registration.")
             self._tools[tool_name] = func
             self._schemas[tool_name] = schema
             logger.debug(f"[ToolRegistry] Registered tool '{tool_name}'")
@@ -83,11 +109,12 @@ class ToolRegistry:
             for k, v in arguments.items():
                 if k in sig.parameters:
                     param = sig.parameters[k]
-                    if param.annotation == bool and isinstance(v, str):
+                    annotation = _unwrap_annotation(param.annotation)
+                    if annotation == bool and isinstance(v, str):
                         cleaned_args[k] = v.strip().lower() in ["true", "1", "yes"]
-                    elif param.annotation == int and isinstance(v, str) and v.isdigit():
+                    elif annotation == int and isinstance(v, str) and v.strip().lstrip("-").isdigit():
                         cleaned_args[k] = int(v)
-                    elif param.annotation == float and isinstance(v, str):
+                    elif annotation == float and isinstance(v, str):
                         try:
                             cleaned_args[k] = float(v)
                         except ValueError:
@@ -101,7 +128,10 @@ class ToolRegistry:
             if inspect.iscoroutinefunction(func):
                 return await func(**cleaned_args)
             else:
-                return func(**cleaned_args)
+                # Sync tools can block for seconds (GUI automation, network IO); run them
+                # in a thread so the realtime voice/event loop is not frozen.
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(None, functools.partial(func, **cleaned_args))
         except Exception as e:
             logger.error(f"[ToolRegistry] Tool '{name}' execution failed: {e}")
             return f"Error executing tool '{name}': {str(e)}"

@@ -6,23 +6,30 @@ from MAG memory, quick reply templates, direct phone URI dispatching, and fallba
 
 import time
 import urllib.parse
-import webbrowser
 import re
 from typing import Optional, Dict, Any, List
 from vision.tools.registry import tool
 from vision.memory.mag_engine import mag_engine
 from vision.logger import logger
+from vision.platform import launch_target, open_url
 
 try:
     import pyautogui
-    import pyperclip
-    import pygetwindow as gw
-    if pyautogui:
-        pyautogui.FAILSAFE = False
-        pyautogui.PAUSE = 0.1
-except ImportError:
+    pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0.1
+except Exception:
+    # pyautogui can raise more than ImportError at import time on a headless /
+    # no-DISPLAY host — don't let that crash the whole module.
     pyautogui = None
+try:
+    import pyperclip
+except Exception:
     pyperclip = None
+try:
+    import pygetwindow as gw
+except Exception:
+    # pygetwindow raises NotImplementedError (not ImportError) on Linux with no
+    # backend; a bare `except ImportError` would let it kill module import.
     gw = None
 
 
@@ -38,6 +45,18 @@ QUICK_WHATSAPP_TEMPLATES = {
     "need_notes": "Hey, could you please share today's class notes / assignment details?",
     "running_late": "Running slightly late due to traffic, will reach soon.",
 }
+
+
+def _record_whatsapp_event(description: str, msg: str) -> None:
+    """Best-effort episodic logging of a sent message; never fails the send."""
+    try:
+        mag_engine.record_event(
+            event_type="whatsapp_message_sent",
+            description=description,
+            metadata=f"Message: {msg[:100]}"
+        )
+    except Exception as e:
+        logger.debug(f"[WhatsAppTool] Event record note: {e}")
 
 
 def _focus_whatsapp_window() -> bool:
@@ -68,7 +87,11 @@ def _resolve_contact_from_memory(target: str) -> str:
         return clean_target
 
     # 1. Use high-precision MAG contact number resolver
-    phone_num = mag_engine.get_contact_number(clean_target)
+    try:
+        phone_num = mag_engine.get_contact_number(clean_target)
+    except Exception as e:
+        logger.debug(f"[WhatsAppTool] Contact number resolve note: {e}")
+        phone_num = None
     if phone_num:
         logger.info(f"[WhatsAppTool] Resolved '{clean_target}' to phone number '{phone_num}' from MAG memory.")
         return phone_num
@@ -199,42 +222,39 @@ def send_whatsapp_message(contact_or_number: str, message: str) -> str:
         encoded_msg = urllib.parse.quote(msg)
         whatsapp_uri = f"whatsapp://send?phone={clean_digits}&text={encoded_msg}"
 
-        # Record episodic event in MAG memory
-        mag_engine.record_event(
-            event_type="whatsapp_message_sent",
-            description=f"Sent WhatsApp message to {raw_input} (+{clean_digits})",
-            metadata=f"Message: {msg[:100]}"
-        )
-
         try:
-            webbrowser.open(whatsapp_uri)
+            # launch_target handles the whatsapp:// URI scheme cross-platform
+            # (cmd /c start on Windows, xdg-open on Linux, open on macOS) — plain
+            # webbrowser.open doesn't reliably dispatch custom URI schemes on POSIX.
+            launch_target(whatsapp_uri)
             time.sleep(2.0)
             _focus_whatsapp_window()
             time.sleep(0.8)
             if pyautogui:
                 pyautogui.press("enter")
-            logger.info(f"[WhatsAppTool] Successfully sent message to {raw_input} (+{clean_digits}): '{msg}'")
-            return f"Successfully sent WhatsApp message to {raw_input} (+{clean_digits}): '{msg}'"
+            # Record episodic event only AFTER a successful dispatch so a failed
+            # send is never logged as sent.
+            _record_whatsapp_event(
+                f"Sent WhatsApp message to {raw_input} (+{clean_digits})", msg
+            )
+            logger.info(f"[WhatsAppTool] Dispatched WhatsApp message to {raw_input} (+{clean_digits}) (delivery unconfirmed): '{msg}'")
+            # We opened WhatsApp and (only when pyautogui is present) pressed enter,
+            # but cannot confirm the message actually left the device — on a headless
+            # host enter is never pressed. Don't claim a guaranteed "sent".
+            return f"Opened WhatsApp and attempted to send your message to {raw_input} (+{clean_digits}): '{msg}'. Please glance at the chat to confirm it went through."
         except Exception as e:
             logger.warning(f"[WhatsAppTool] Desktop protocol failed, opening Web: {e}")
             web_url = f"https://web.whatsapp.com/send?phone={clean_digits}&text={encoded_msg}"
-            webbrowser.open(web_url)
+            open_url(web_url)
             return f"Opened WhatsApp Web for {raw_input} (+{clean_digits}) with your message."
 
     # Name-Based WhatsApp Desktop Search Fallback
     target_name = resolved_target
     logger.info(f"[WhatsAppTool] Searching WhatsApp Desktop for contact '{target_name}'...")
 
-    # Record episodic event in MAG memory
-    mag_engine.record_event(
-        event_type="whatsapp_message_sent",
-        description=f"Sent WhatsApp message to {target_name}",
-        metadata=f"Message: {msg[:100]}"
-    )
-
     has_focus = _focus_whatsapp_window()
     if not has_focus:
-        webbrowser.open("whatsapp://")
+        launch_target("whatsapp://")
         time.sleep(2.5)
         _focus_whatsapp_window()
 
@@ -273,8 +293,11 @@ def send_whatsapp_message(contact_or_number: str, message: str) -> str:
     time.sleep(0.4)
     pyautogui.press("enter")
 
-    logger.info(f"[WhatsAppTool] Sent message to '{target_name}': '{msg}'")
-    return f"Successfully sent WhatsApp message to '{target_name}': '{msg}'"
+    logger.info(f"[WhatsAppTool] Dispatched message to '{target_name}' (delivery unconfirmed): '{msg}'")
+    _record_whatsapp_event(f"Sent WhatsApp message to {target_name}", msg)
+    # Name-based search picks WhatsApp's top match and presses enter blindly; we
+    # can't verify the right chat got it, so don't claim a guaranteed "sent".
+    return f"Opened WhatsApp and attempted to send your message to '{target_name}': '{msg}'. Please confirm the right chat received it, as I can't verify delivery."
 
 
 @tool(

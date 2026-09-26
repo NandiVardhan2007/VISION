@@ -16,25 +16,33 @@ from vision.memory.working_memory import working_memory
 from vision.logger import logger
 from vision.platform import IS_WINDOWS
 
+# Split per-backend so a missing PIL/pymupdf doesn't null out the pywin32 stack
+# (or vice-versa) and needlessly disable an otherwise-usable print path.
 try:
     import win32print
     import win32ui
     import win32con
-    from PIL import Image, ImageWin
-    import pymupdf
-except ImportError:
+except Exception:
     win32print = None
     win32ui = None
     win32con = None
+
+try:
+    from PIL import Image, ImageWin
+except Exception:
     Image = None
     ImageWin = None
+
+try:
+    import pymupdf
+except Exception:
     pymupdf = None
 
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import cm
     from reportlab.pdfgen import canvas
-except ImportError:
+except Exception:
     canvas = None
 
 
@@ -48,8 +56,11 @@ def check_printer_available(printer_name: Optional[str] = None) -> Dict[str, Any
                 return {"available": False, "name": None, "error": "No printer detected or configured on this computer."}
 
             hprinter = win32print.OpenPrinter(target_printer)
-            p_info = win32print.GetPrinter(hprinter, 2)
-            win32print.ClosePrinter(hprinter)
+            try:
+                p_info = win32print.GetPrinter(hprinter, 2)
+            finally:
+                # Always release the OS printer handle, even if GetPrinter raises.
+                win32print.ClosePrinter(hprinter)
 
             status = p_info.get("Status", 0)
             if status & 0x00000080:  # PRINTER_STATUS_OFFLINE
@@ -186,7 +197,17 @@ def _print_pdf_posix(pdf_path: Path, printer_name: Optional[str], copies: int = 
     for _ in range(max(1, copies)):
         cmd_c = cmd + [str(pdf_path)]
         try:
-            subprocess.run(cmd_c, check=False, capture_output=True, text=True, errors="ignore")
+            res = subprocess.run(cmd_c, check=False, capture_output=True, text=True, errors="ignore", timeout=30)
+            if res.returncode != 0:
+                # lp/lpr failed (no such printer, spooler down, etc.). Don't
+                # report a phantom success — surface the failure to the caller.
+                logger.warning(
+                    f"[PrinterTool] {sender} exited {res.returncode}: {(res.stderr or '').strip()[:200]}"
+                )
+                return False
+        except subprocess.TimeoutExpired:
+            logger.warning(f"[PrinterTool] {sender} timed out after 30s (spooler stuck?).")
+            return False
         except Exception as e:
             logger.warning(f"[PrinterTool] POSIX print error: {e}")
             return False
@@ -195,7 +216,7 @@ def _print_pdf_posix(pdf_path: Path, printer_name: Optional[str], copies: int = 
 
 def _print_pdf_cross_platform(pdf_path: Path, printer_name: str, copies: int = 1, page_selection: Optional[Union[str, int]] = None) -> bool:
     """Dispatch a print job using the best available backend for the OS."""
-    if IS_WINDOWS and pymupdf and win32ui and win32print:
+    if IS_WINDOWS and pymupdf and win32ui and win32print and Image and ImageWin:
         return _print_pdf_direct_gdi(pdf_path, printer_name, copies=copies, page_selection=page_selection)
     if shutil.which("lp") or shutil.which("lpr"):
         return _print_pdf_posix(pdf_path, printer_name, copies=copies, page_selection=page_selection)
@@ -205,37 +226,45 @@ def _print_pdf_cross_platform(pdf_path: Path, printer_name: str, copies: int = 1
 
 def _print_pdf_direct_gdi(pdf_path: Path, printer_name: str, copies: int = 1, page_selection: Optional[Union[str, int]] = None) -> bool:
     """Render selected PDF pages and send direct GDI raster print jobs to the Windows printer DC."""
-    if not pymupdf or not win32ui or not win32print:
+    if not pymupdf or not win32ui or not win32print or not Image or not ImageWin:
         return False
 
     doc = pymupdf.open(str(pdf_path))
-    total_pages = len(doc)
-    selected_indices = _parse_page_selection(page_selection, total_pages)
+    try:
+        total_pages = len(doc)
+        selected_indices = _parse_page_selection(page_selection, total_pages)
 
-    for copy_idx in range(copies):
-        hdc = win32ui.CreateDC()
-        hdc.CreatePrinterDC(printer_name)
-        page_info = f"Pages {[idx+1 for idx in selected_indices]}" if len(selected_indices) < total_pages else "All Pages"
-        hdc.StartDoc(f"VISION Print - {pdf_path.name} ({page_info} - Copy {copy_idx + 1}/{copies})")
+        # max(1, copies) mirrors the POSIX path so a stray copies<=0 doesn't
+        # skip the loop and report a phantom success.
+        for copy_idx in range(max(1, copies)):
+            hdc = win32ui.CreateDC()
+            try:
+                hdc.CreatePrinterDC(printer_name)
+                page_info = f"Pages {[idx+1 for idx in selected_indices]}" if len(selected_indices) < total_pages else "All Pages"
+                hdc.StartDoc(f"VISION Print - {pdf_path.name} ({page_info} - Copy {copy_idx + 1}/{max(1, copies)})")
 
-        printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
-        printable_height = hdc.GetDeviceCaps(win32con.VERTRES)
+                printable_width = hdc.GetDeviceCaps(win32con.HORZRES)
+                printable_height = hdc.GetDeviceCaps(win32con.VERTRES)
 
-        for page_idx in selected_indices:
-            page = doc[page_idx]
-            pix = page.get_pixmap(dpi=300)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                for page_idx in selected_indices:
+                    page = doc[page_idx]
+                    pix = page.get_pixmap(dpi=300)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-            hdc.StartPage()
-            dib = ImageWin.Dib(img)
-            dib.draw(hdc.GetHandleOutput(), (0, 0, printable_width, printable_height))
-            hdc.EndPage()
+                    hdc.StartPage()
+                    dib = ImageWin.Dib(img)
+                    dib.draw(hdc.GetHandleOutput(), (0, 0, printable_width, printable_height))
+                    hdc.EndPage()
 
-        hdc.EndDoc()
-        hdc.DeleteDC()
-        time.sleep(0.5)
-
-    doc.close()
+                hdc.EndDoc()
+            finally:
+                # Always release the GDI device context, even if a page raises,
+                # so repeated failures don't exhaust GDI handles.
+                hdc.DeleteDC()
+            time.sleep(0.5)
+    finally:
+        # Always close the PDF so the file isn't left locked on Windows.
+        doc.close()
     return True
 
 
@@ -257,6 +286,15 @@ def print_document(file_path: str, copies: int = 1, pages: Optional[Union[str, i
             f"Error: '{p.name}' is not a PDF. The direct GDI printer pipeline "
             f"only supports .pdf documents (convert or export first)."
         )
+
+    # Normalize the copy count once so the printed count and the reported count
+    # agree — the print loop uses max(1, copies), so a copies<=0 request prints
+    # one copy; without this the success message would claim "0 copies".
+    try:
+        copies = int(copies)
+    except (TypeError, ValueError):
+        copies = 1
+    copies = max(1, copies)
 
     # 1. Verify Printer Connection
     chk = check_printer_available(printer_name)

@@ -3,8 +3,8 @@ Webcam and RTSP camera frame capture manager.
 """
 
 from typing import Optional
-from io import BytesIO
 from vision.logger import logger
+from vision.platform import IS_WINDOWS
 
 try:
     import cv2
@@ -22,19 +22,33 @@ class CameraCapture:
         if cv2 is None:
             logger.warning("[CameraCapture] OpenCV (cv2) is not installed.")
             return None
+        cap = None
         try:
-            cap = cv2.VideoCapture(self.camera_index)
+            # On Windows the default MSMF backend is slow to open and can fail on
+            # some webcams; DirectShow (CAP_DSHOW) is far more reliable.
+            if IS_WINDOWS:
+                cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+            else:
+                cap = cv2.VideoCapture(self.camera_index)
+            if not cap.isOpened():
+                logger.warning(f"[CameraCapture] Could not open camera index {self.camera_index} (in use or no device).")
+                return None
             ret, frame = cap.read()
-            cap.release()
             if not ret:
                 return None
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if ret:
+            ok, jpeg = cv2.imencode('.jpg', frame)
+            if ok:
                 return jpeg.tobytes()
             return None
         except Exception as e:
             logger.error(f"[CameraCapture] Failed to grab frame: {e}")
             return None
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
 
 
 camera_capture = CameraCapture()

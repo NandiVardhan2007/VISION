@@ -8,20 +8,26 @@ from vision.config import config
 from vision.logger import logger
 
 try:
+    import numpy as np
+except ImportError:
+    np = None
+
+# Silero (and its torch backend) is a heavy optional dependency. Keep it in its
+# own block so a missing silero_vad doesn't also null out numpy — otherwise the
+# Energy RMS fallback below becomes unreachable and VAD reports speech constantly.
+try:
     import torch
     import silero_vad
     from silero_vad import load_silero_vad, VADIterator
-    import numpy as np
 except ImportError:
     torch = None
     silero_vad = None
     load_silero_vad = None
     VADIterator = None
-    np = None
 
 
 class VADDetector:
-    def __init__(self, energy_threshold: float = 0.02, silero_threshold: float = None):
+    def __init__(self, energy_threshold: float = 0.02, silero_threshold: Optional[float] = None):
         self.energy_threshold = energy_threshold
         self.silero_threshold = silero_threshold or getattr(config, "VISION_VAD_THRESHOLD", 0.50)
         self.model = None
@@ -101,15 +107,19 @@ class VADDetector:
                 # Resample to 16kHz and append to rolling buffer
                 samples_16k = self.resample_to_16k(samples, sample_rate) if sample_rate != 16000 else samples
                 self._buffer_16k = np.append(self._buffer_16k, samples_16k)
-                if len(self._buffer_16k) > 1536:
-                    self._buffer_16k = self._buffer_16k[-1536:]
 
-                # Silero expects 512 samples at 16kHz
-                if len(self._buffer_16k) >= 512:
-                    chunk_512 = self._buffer_16k[-512:]
+                # Silero expects contiguous 512-sample frames at 16kHz. Consume the
+                # buffer in exact non-overlapping 512-sample steps and keep the last
+                # frame's probability — feeding overlapping/gapped [-512:] slices
+                # corrupts the model's recurrent state and skips ~half the audio.
+                last_prob = None
+                while len(self._buffer_16k) >= 512:
+                    chunk_512 = self._buffer_16k[:512]
+                    self._buffer_16k = self._buffer_16k[512:]
                     tensor = torch.from_numpy(chunk_512).float()
-                    speech_prob = float(self.model(tensor, 16000).item())
-                    return speech_prob
+                    last_prob = float(self.model(tensor, 16000).item())
+                if last_prob is not None:
+                    return last_prob
             except Exception:
                 pass
 

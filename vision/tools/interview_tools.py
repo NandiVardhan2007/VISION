@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from vision.tools.registry import tool
 from vision.logger import logger
 from vision.tools.input_tools import type_text_into_application
+from vision.platform import IS_WINDOWS, open_path
 
 
 class InterviewManager:
@@ -26,9 +27,9 @@ class InterviewManager:
 
     def start_session(self, topic: str = "Software Engineering", interview_type: str = "Technical", difficulty: str = "Medium") -> str:
         self.is_active = True
-        self.role_or_topic = topic.strip() or "Software Engineering"
-        self.interview_type = interview_type.capitalize()
-        self.difficulty = difficulty.capitalize()
+        self.role_or_topic = (topic or "").strip() or "Software Engineering"
+        self.interview_type = ((interview_type or "").strip() or "Technical").capitalize()
+        self.difficulty = ((difficulty or "").strip() or "Medium").capitalize()
         self.current_question_index = 0
         self.history = []
         self.start_time = time.time()
@@ -175,11 +176,19 @@ def evaluate_interview_answer(answer_summary: str, constructive_feedback: str, s
     if not interview_manager.is_active:
         return "No mock interview is currently active, Nandu! Say 'Hey VISION, start a mock interview for Python' to begin."
 
+    try:
+        score = int(score_out_of_10 or 0)
+    except (TypeError, ValueError):
+        score = 0
+
     msg, is_finished = interview_manager.record_answer_and_get_next(
-        answer=answer_summary,
-        feedback=constructive_feedback,
-        score=max(1, min(10, score_out_of_10))
+        answer=(answer_summary or "").strip() or "(no answer provided)",
+        feedback=(constructive_feedback or "").strip() or "(no feedback provided)",
+        score=max(1, min(10, score))
     )
+
+    if is_finished:
+        return msg + "\n\n" + interview_manager.generate_report()
 
     return msg
 
@@ -195,9 +204,20 @@ def end_mock_interview(write_to_notepad: bool = False) -> str:
 
     if write_to_notepad:
         try:
-            type_text_into_application(text=report, target_app="Notepad")
+            if IS_WINDOWS:
+                type_text_into_application(text=report, target_app="Notepad")
+            else:
+                # No Notepad on POSIX — save the report and open it in the
+                # default editor/viewer instead.
+                from pathlib import Path
+                out_dir = Path.home() / "Documents"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_file = out_dir / f"mock_interview_report_{int(time.time())}.txt"
+                out_file.write_text(report, encoding="utf-8")
+                open_path(str(out_file))
+                logger.info(f"[InterviewTool] Saved interview report to {out_file}")
         except Exception as e:
-            logger.warning(f"[InterviewTool] Could not open Notepad: {e}")
+            logger.warning(f"[InterviewTool] Could not write interview report: {e}")
 
     total_score = sum(h["score"] for h in interview_manager.history) if interview_manager.history else 0
     avg_score = round(total_score / len(interview_manager.history), 1) if interview_manager.history else 0

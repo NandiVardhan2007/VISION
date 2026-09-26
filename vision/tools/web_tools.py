@@ -11,22 +11,25 @@ from vision.logger import logger
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*duckduckgo_search.*")
 
+# Optional deps: catch Exception (not just ImportError). A partially-installed
+# or backend-broken package can raise beyond ImportError at import time, which
+# would otherwise kill this whole module's import and disable every web tool.
 try:
     from ddgs import DDGS
-except ImportError:
+except Exception:
     try:
         from duckduckgo_search import DDGS
-    except ImportError:
+    except Exception:
         DDGS = None
 
 try:
     import httpx
-except ImportError:
+except Exception:
     httpx = None
 
 try:
     from bs4 import BeautifulSoup
-except ImportError:
+except Exception:
     BeautifulSoup = None
 
 
@@ -38,7 +41,12 @@ def search_web(query: str) -> str:
 
     try:
         logger.info(f"[WebTool] Searching internet for: '{query}'")
-        ddgs = DDGS()
+        # Bound the network wait so a slow/hanging backend can't stall the tool.
+        # Some older DDGS builds don't accept a `timeout` kwarg — fall back cleanly.
+        try:
+            ddgs = DDGS(timeout=10)
+        except TypeError:
+            ddgs = DDGS()
         results = list(ddgs.text(query, max_results=5))
 
         if not results:
@@ -46,7 +54,9 @@ def search_web(query: str) -> str:
 
         formatted_lines = [f"Live Web Search Results for '{query}':\n"]
         for idx, r in enumerate(results, 1):
-            title = r.get("title", "No Title")
+            # Guard present-but-None: some backends return {"title": None},
+            # and .get(k, default) only substitutes when the key is absent.
+            title = r.get("title") or "No Title"
             snippet = r.get("body") or r.get("description") or ""
             link = r.get("href") or r.get("url") or ""
             formatted_lines.append(f"[{idx}] {title}\nSummary: {snippet}\nSource: {link}\n")
@@ -109,12 +119,12 @@ def get_weather_forecast(location: str = "Hyderabad") -> str:
         curr = data["current_condition"][0]
         temp_c = curr.get("temp_C", "N/A")
         feels_like_c = curr.get("FeelsLikeC", "N/A")
-        desc = curr.get("weatherDesc", [{}])[0].get("value", "N/A")
+        desc = (curr.get("weatherDesc") or [{}])[0].get("value", "N/A")
         humidity = curr.get("humidity", "N/A")
         wind_kmph = curr.get("windspeedKmph", "N/A")
 
         # Today's forecast min/max
-        weather_today = data.get("weather", [{}])[0]
+        weather_today = (data.get("weather") or [{}])[0]
         max_temp = weather_today.get("maxtempC", "N/A")
         min_temp = weather_today.get("mintempC", "N/A")
 

@@ -74,7 +74,18 @@ class Session:
         msg = Message(role=role, content=content, **kwargs)
         self.messages.append(msg)
         self.last_active_at = time.time()
-        session_manager.save_to_disk()
+        # Persist only genuine conversational turns (user/assistant text) to the
+        # durable transcript. Tool results and empty assistant tool-call stubs are
+        # working-memory only. Previously this called session_manager.save_to_disk()
+        # directly, which re-wrote the untouched _transcripts list — so new turns
+        # were never persisted (lost on restart) and every message triggered a
+        # redundant full-file rewrite.
+        if role in ("user", "assistant") and content and not kwargs.get("tool_calls"):
+            session_manager.append_transcript(
+                speaker="ai" if role == "assistant" else "user",
+                label="VISION" if role == "assistant" else "You",
+                text=content,
+            )
         return msg
 
     def get_messages_for_llm(self, max_history: int = 25) -> List[Dict[str, Any]]:
@@ -133,7 +144,7 @@ class SessionManager:
             with open(CONVERSATIONS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            raw_transcripts = data.get("conversations", [])
+            raw_transcripts = data.get("conversations") or []
             self._transcripts = raw_transcripts
 
             # Populate primary sessions so LLM immediately has past conversation turns in working memory
@@ -142,7 +153,10 @@ class SessionManager:
                 s = self.get_or_create(s_id)
                 s.messages.clear()
 
-                for item in raw_transcripts:
+                # Only seed the last 200 turns into each live session's working
+                # memory — loading the full on-disk history would balloon the LLM
+                # context (and memory) on every restart as the archive grows.
+                for item in raw_transcripts[-200:]:
                     speaker = item.get("speaker", "user")
                     role = "assistant" if speaker == "ai" else "user"
                     text = item.get("text", "")
@@ -169,7 +183,7 @@ class SessionManager:
                 "total_conversations": len(self._transcripts),
                 "conversations": self._transcripts
             }
-            tmp_file = CONVERSATIONS_FILE.with_suffix(".tmp")
+            tmp_file = CONVERSATIONS_FILE.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
             with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
             tmp_file.replace(CONVERSATIONS_FILE)
@@ -202,6 +216,12 @@ class SessionManager:
             "timestamp": timestamp or now.isoformat()
         }
         self._transcripts.append(entry)
+        # Cap persisted history: save_to_disk rewrites the entire list on every
+        # append, so an unbounded transcript means ever-growing files and O(n)
+        # writes. Keep the most recent 2000 turns.
+        MAX_TRANSCRIPTS = 2000
+        if len(self._transcripts) > MAX_TRANSCRIPTS:
+            del self._transcripts[:-MAX_TRANSCRIPTS]
         self.save_to_disk()
         return entry
 

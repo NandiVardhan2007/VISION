@@ -20,7 +20,9 @@ class GroqLLMProvider(BaseLLMProvider):
     def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile"):
         super().__init__(name="Groq", model=model)
         self.api_key = api_key
-        self.client = AsyncGroq(api_key=api_key) if AsyncGroq else None
+        # Cap every request so a stalled connection triggers failover instead of
+        # blocking the whole chain for the SDK's ~600s default.
+        self.client = AsyncGroq(api_key=api_key, timeout=20.0, max_retries=1) if AsyncGroq else None
         self._total_latency_ms = 0.0
 
     def _recover_failed_tool_call(self, err_msg: str) -> Optional[List[Dict[str, Any]]]:
@@ -68,7 +70,7 @@ class GroqLLMProvider(BaseLLMProvider):
             candidate_str = candidate_str.replace('\\"', '"').replace("\\'", "'")
             try:
                 data = json.loads(candidate_str)
-                func_name = data.get("name") or data.get("function", {}).get("name")
+                func_name = data.get("name") or (data.get("function") or {}).get("name")
                 args = data.get("arguments") or data.get("parameters") or {}
                 if isinstance(args, str):
                     try:
@@ -119,6 +121,10 @@ class GroqLLMProvider(BaseLLMProvider):
             duration_ms = (time.time() - start_time) * 1000
             self._update_stats(duration_ms)
 
+            # OpenAI-compatible endpoints can return HTTP 200 with choices:[] on
+            # an upstream hiccup — surface it clearly instead of an IndexError.
+            if not response.choices:
+                raise RuntimeError(f"[{self.name}] empty choices in response")
             choice = response.choices[0]
             message_obj = choice.message
             tool_calls = None
@@ -146,6 +152,8 @@ class GroqLLMProvider(BaseLLMProvider):
                         response = await self.client.chat.completions.create(**kwargs)
                         duration_ms = (time.time() - start_time) * 1000
                         self._update_stats(duration_ms)
+                        if not response.choices:
+                            raise RuntimeError(f"[{self.name}] empty choices in fallback response")
                         choice = response.choices[0]
                         message_obj = choice.message
                         tool_calls = None
@@ -206,6 +214,9 @@ class GroqLLMProvider(BaseLLMProvider):
             }
             if max_tokens:
                 kwargs["max_tokens"] = max_tokens
+            # Forward tools when supplied instead of silently dropping them.
+            if tools:
+                kwargs["tools"] = tools
 
             stream = await self.client.chat.completions.create(**kwargs)
             async for chunk in stream:

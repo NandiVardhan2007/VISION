@@ -23,11 +23,20 @@ def send_email(to_address: str, subject: str, body: str) -> str:
         msg["Subject"] = subject
         msg.attach(MIMEText(body, "plain"))
 
-        server = smtplib.SMTP(config.EMAIL_SMTP_HOST, config.EMAIL_SMTP_PORT, timeout=15)
-        server.starttls()
-        server.login(config.VISION_EMAIL, config.EMAIL_PASSWORD)
-        server.send_message(msg)
-        server.quit()
+        # Port 465 speaks implicit TLS from the first byte (SMTP_SSL); 587 (and
+        # 25) use plaintext + STARTTLS. Using starttls() on 465 hangs/fails.
+        # Context manager guarantees the socket is closed even when login/send
+        # raises (wrong password, bad recipient), so failed sends don't leak FDs.
+        port = config.EMAIL_SMTP_PORT
+        if port == 465:
+            with smtplib.SMTP_SSL(config.EMAIL_SMTP_HOST, port, timeout=15) as server:
+                server.login(config.VISION_EMAIL, config.EMAIL_PASSWORD)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(config.EMAIL_SMTP_HOST, port, timeout=15) as server:
+                server.starttls()
+                server.login(config.VISION_EMAIL, config.EMAIL_PASSWORD)
+                server.send_message(msg)
         return f"Successfully sent email to {to_address} with subject '{subject}'."
     except Exception as e:
         logger.error(f"[EmailTool] Send failed: {e}")

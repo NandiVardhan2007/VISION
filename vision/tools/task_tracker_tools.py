@@ -4,7 +4,6 @@ Allows VISION to manage tasks, toggle completions, generate summaries, and synch
 """
 
 import os
-import subprocess
 from typing import Optional
 from vision.tools.registry import tool
 from vision.memory.task_tracker_db import task_db
@@ -27,11 +26,16 @@ def add_task(title: str, day: Optional[int] = None, month: Optional[str] = None,
             category=category,
             priority=priority
         )
+        excel_note = "Excel tracker updated."
         try:
             excel_tracker.generate_workbook(year=task["year"])
         except PermissionError:
             logger.warning("[TaskTrackerTool] Excel file is currently open in another app. Saved to database.")
-        return f"Successfully added task #{task['id']}: '{task['title']}' for {task['month']} {task['day']}, {task['year']} (Category: {task['category']}, Priority: {task['priority']}). Excel tracker updated."
+            excel_note = "Excel tracker is open in another app, so only the database was updated."
+        except Exception as _e:
+            logger.warning(f"[TaskTrackerTool] Excel refresh skipped: {_e}")
+            excel_note = "Excel tracker could not be refreshed (saved to the database)."
+        return f"Successfully added task #{task['id']}: '{task['title']}' for {task['month']} {task['day']}, {task['year']} (Category: {task['category']}, Priority: {task['priority']}). {excel_note}"
     except Exception as e:
         logger.error(f"[TaskTrackerTool] Error adding task: {e}")
         return f"Failed to add task: {str(e)}"
@@ -45,8 +49,13 @@ def complete_task(task_name_or_id: str, completed: bool = True, day: Optional[in
     """Mark a task completed/uncompleted."""
     try:
         task = None
-        if task_name_or_id.isdigit():
-            task = task_db.toggle_task(int(task_name_or_id), completed=completed)
+        ident = str(task_name_or_id).strip() if task_name_or_id is not None else ""
+        if ident.isdigit():
+            task = task_db.toggle_task(int(ident), completed=completed)
+            if not task:
+                # A numeric string may actually be (part of) a task title rather
+                # than an ID; fall back to name matching before giving up.
+                task = task_db.complete_task_by_name(task_name=task_name_or_id, day=day, month=month, completed=completed)
         else:
             task = task_db.complete_task_by_name(task_name=task_name_or_id, day=day, month=month, completed=completed)
 
@@ -54,11 +63,16 @@ def complete_task(task_name_or_id: str, completed: bool = True, day: Optional[in
             return f"Could not find a task matching '{task_name_or_id}'."
 
         status_str = "COMPLETED ✅" if task["is_completed"] == 1 else "PENDING ⏳"
+        excel_note = "Excel dashboard refreshed."
         try:
             excel_tracker.generate_workbook(year=task["year"])
         except PermissionError:
             logger.warning("[TaskTrackerTool] Excel file is currently open in another app. Saved to database.")
-        return f"Task #{task['id']} '{task['title']}' marked as {status_str} for {task['month']} {task['day']}. Excel dashboard refreshed."
+            excel_note = "Excel dashboard is open in another app, so only the database was updated."
+        except Exception as _e:
+            logger.warning(f"[TaskTrackerTool] Excel refresh skipped: {_e}")
+            excel_note = "Excel dashboard could not be refreshed (saved to the database)."
+        return f"Task #{task['id']} '{task['title']}' marked as {status_str} for {task['month']} {task['day']}. {excel_note}"
     except Exception as e:
         logger.error(f"[TaskTrackerTool] Error toggling task: {e}")
         return f"Failed to toggle task: {str(e)}"
@@ -188,14 +202,16 @@ def log_leetcode_solved(day: Optional[int] = None, month: Optional[str] = None) 
                 category="Coding",
                 priority="High"
             )
-            task_db.toggle_task_completion(new_task["id"], completed=True)
+            task_db.toggle_task(new_task["id"], completed=True)
         else:
-            task_db.toggle_task_completion(leetcode_task["id"], completed=True)
+            task_db.toggle_task(leetcode_task["id"], completed=True)
 
         try:
             excel_tracker.generate_workbook()
         except PermissionError:
             pass
+        except Exception as _e:
+            logger.warning(f"[TaskTrackerTool] Excel refresh skipped: {_e}")
 
         streak = task_db.calculate_leetcode_streak(year=year)
         return f"🔥 Awesome job! Daily LeetCode problem marked as SOLVED for {month_name} {day}, {year}. Your Coding Streak is now **{streak} Day{'s' if streak != 1 else ''}**! 🚀 Keep the momentum going!"

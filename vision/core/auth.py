@@ -19,8 +19,15 @@ class Authenticator:
         return True
 
     def verify_token(self, token: str) -> bool:
-        """Simple API session auth check."""
-        return True
+        """Validate an API session token against the configured VISION_API_KEY.
+
+        When no key is configured, auth is disabled and any token is accepted
+        (frictionless local use). Otherwise the token must match exactly.
+        """
+        configured = getattr(config, "VISION_API_KEY", None)
+        if not configured or not str(configured).strip():
+            return True
+        return bool(token) and token.strip() == str(configured).strip()
 
 
 auth = Authenticator()

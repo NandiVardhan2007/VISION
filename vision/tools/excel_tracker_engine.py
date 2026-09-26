@@ -5,12 +5,25 @@ KPI dashboard cards, 12 monthly sheets with 31-day tracking grids, and condition
 """
 
 import os
+import threading
 from datetime import datetime
 from typing import Optional, Dict, Any, List
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.chart import PieChart, Reference
-from openpyxl.formatting.rule import FormulaRule, CellIsRule
+
+# openpyxl is only needed for Excel export. Guard the import so a missing
+# dependency degrades the Excel feature gracefully instead of breaking the
+# whole task-tracker tool chain (task_tracker_tools imports this module).
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.chart import PieChart, Reference
+    from openpyxl.formatting.rule import FormulaRule, CellIsRule
+    _OPENPYXL_OK = True
+except Exception:
+    # openpyxl (and its optional C-accelerated deps) can raise more than
+    # ImportError on a partial/broken install; don't let that break import of
+    # this module, which task_tracker_tools depends on.
+    openpyxl = None
+    _OPENPYXL_OK = False
 
 from vision.memory.task_tracker_db import task_db
 from vision.logger import logger
@@ -26,8 +39,20 @@ class ExcelTrackerEngine:
     def __init__(self, filepath: str = EXCEL_OUTPUT_PATH):
         self.filepath = filepath
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        # Serialize workbook generation: sync tools run in threads, and two
+        # concurrent saves to the same .xlsx would corrupt it.
+        self._lock = threading.Lock()
 
     def generate_workbook(self, year: Optional[int] = None) -> str:
+        """Build and save the Excel Task Tracker workbook (thread-safe)."""
+        if not _OPENPYXL_OK:
+            raise RuntimeError(
+                "openpyxl is not installed; run 'pip install openpyxl' to enable the Excel tracker."
+            )
+        with self._lock:
+            return self._generate_workbook_locked(year)
+
+    def _generate_workbook_locked(self, year: Optional[int] = None) -> str:
         """Build and save the entire interactive Excel Task Tracker workbook."""
         curr = task_db.get_current_date_info()
         year = year or curr["year"]
@@ -173,7 +198,9 @@ class ExcelTrackerEngine:
         try:
             pie = PieChart()
             pie.title = "🏆 Overall Task Completion Ratio"
-            pie.title.text.font = font_tbl_header
+            # NOTE: `pie.title.text.font = ...` is a no-op — openpyxl builds the
+            # title's rich text from the string and ignores a font assigned this
+            # way, so it was dropped rather than kept as misleading dead code.
             labels = Reference(ws_dash, min_col=10, min_row=10, max_row=11)
             data = Reference(ws_dash, min_col=11, min_row=9, max_row=11)
             pie.add_data(data, titles_from_data=True)
@@ -214,7 +241,12 @@ class ExcelTrackerEngine:
             ws_month["F3"] = "Total Tasks:"
             ws_month["G3"] = "=COUNTA(B8:B150)"
             ws_month["F4"] = "Completed:"
-            ws_month["G4"] = '=COUNTIF(E8:E150, TRUE) + COUNTIF(E8:E150, "TRUE") + COUNTIF(E8:E150, 1)'
+            # Completed cells are written as Excel logical booleans (value=True,
+            # see column 5 below), and COUNTIF coerces TRUE, "TRUE" and 1 to the
+            # same logical value — so the old 3-term sum counted each completed
+            # task up to 3×, inflating the dashboard COMPLETED card and the
+            # completion-rate KPI past 100%. One criterion is exact and correct.
+            ws_month["G4"] = '=COUNTIF(E8:E150, TRUE)'
             
             for cell_ref in ["F3", "F4"]:
                 ws_month[cell_ref].font = Font(name="Segoe UI", size=9, bold=True, color="94A3B8")
@@ -306,7 +338,15 @@ class ExcelTrackerEngine:
             ws_month.column_dimensions["F"].width = 22
             ws_month.column_dimensions["G"].width = 12
 
-        wb.save(self.filepath)
+        try:
+            wb.save(self.filepath)
+        finally:
+            # openpyxl workbooks hold open file handles for any read images/charts;
+            # close explicitly so Windows doesn't keep the .xlsx locked (WinError 32).
+            try:
+                wb.close()
+            except Exception:
+                pass
         logger.info(f"[ExcelTrackerEngine] Workbook successfully saved at '{self.filepath}'")
         return self.filepath
 

@@ -1,12 +1,20 @@
 """
 Hands-Free Local Wake-Word Engine for VISION AI OS.
-Provides continuous ambient listening for 'Hey VISION', 'Vision', and 'Hey Jarvis' with local zero-latency ONNX inference.
+Provides continuous ambient listening with local zero-latency openWakeWord ONNX
+inference. The trigger phrase(s) come from config.VISION_WAKE_WORDS; the shipped
+openWakeWord pretrained models are "hey_jarvis", "alexa", and "hey_mycroft"
+(there is no pretrained "hey_vision" model), so "Hey Jarvis" is the default.
 """
 
 import time
-import numpy as np
 from typing import Optional, List, Dict
 from vision.logger import logger
+from vision.config import config
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
 
 try:
     import sounddevice as sd
@@ -20,13 +28,19 @@ except ImportError:
 
 
 class WakeWordEngine:
-    def __init__(self, target_phrases: Optional[List[str]] = None, threshold: float = 0.45):
-        self.target_phrases = target_phrases or ["hey_jarvis", "alexa", "hey_mycroft"]
-        self.threshold = threshold
+    def __init__(self, target_phrases: Optional[List[str]] = None, threshold: Optional[float] = None):
+        self.target_phrases = target_phrases or list(config.VISION_WAKE_WORDS)
+        self.threshold = threshold if threshold is not None else config.VISION_WAKE_WORD_THRESHOLD
         self.sample_rate = 16000
         self.chunk_size = 1280  # 80ms chunk for openwakeword (1280 samples at 16kHz)
         self.model = None
         self._init_model()
+
+    def _friendly_trigger(self) -> str:
+        """Human-readable trigger phrase for logs (e.g. 'hey_jarvis' -> 'Hey Jarvis')."""
+        if not self.target_phrases:
+            return "the wake word"
+        return self.target_phrases[0].replace("_", " ").title()
 
     def _init_model(self):
         """Initialize OpenWakeWord ONNX models."""
@@ -43,7 +57,7 @@ class WakeWordEngine:
 
     def play_activation_chime(self):
         """Plays a pleasant 2-tone ascending activation chime (440Hz -> 880Hz)."""
-        if sd is None:
+        if sd is None or np is None:
             return
         try:
             sr = 44100
@@ -73,9 +87,12 @@ class WakeWordEngine:
         if sd is None:
             logger.warning("[WakeWord] sounddevice is unavailable.")
             return False
+        if np is None:
+            logger.warning("[WakeWord] numpy is unavailable; wake-word detection disabled.")
+            return False
 
         start_time = time.time()
-        logger.info("[WakeWord] Ambient listening active... (Say 'Hey VISION' or 'Vision')")
+        logger.info(f"[WakeWord] Ambient listening active... (Say '{self._friendly_trigger()}')")
 
         try:
             with sd.InputStream(
@@ -89,7 +106,10 @@ class WakeWordEngine:
                         return False
 
                     audio_data, _ = stream.read(self.chunk_size)
-                    audio_chunk = np.frombuffer(audio_data, dtype=np.int16)
+                    # stream.read already returns an int16 ndarray of shape
+                    # (frames, channels); flatten to 1-D rather than
+                    # reinterpreting the buffer with np.frombuffer.
+                    audio_chunk = np.asarray(audio_data, dtype=np.int16).reshape(-1)
 
                     # 1. OpenWakeWord model inference
                     if self.model is not None:

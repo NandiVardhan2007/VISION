@@ -47,8 +47,10 @@ def test_whatsapp_templates():
     assert "in_class" in templates
 
 
-@patch("vision.tools.whatsapp_tools.webbrowser.open")
-def test_whatsapp_interactive_confirmation_flow(mock_web_open):
+@patch("vision.tools.whatsapp_tools.pyautogui")
+@patch("vision.tools.whatsapp_tools.open_url")
+@patch("vision.tools.whatsapp_tools.launch_target")
+def test_whatsapp_interactive_confirmation_flow(mock_launch, mock_open_url, mock_pyautogui):
     # 1. Prepare draft
     draft_res = prepare_whatsapp_message(
         contact_or_number="Amma",
@@ -68,7 +70,9 @@ def test_whatsapp_interactive_confirmation_flow(mock_web_open):
     with patch("vision.tools.whatsapp_tools._focus_whatsapp_window", return_value=True):
         send_res = confirm_and_send_whatsapp_draft()
         assert "Successfully sent WhatsApp message" in send_res or "Opened WhatsApp" in send_res
-        mock_web_open.assert_called()
+        # Dispatch now goes through the cross-platform launcher (whatsapp:// URI)
+        # or the web fallback, never webbrowser directly.
+        assert mock_launch.called or mock_open_url.called
 
     # 4. Pending draft should now be cleared
     assert get_pending_whatsapp_draft() == "No pending WhatsApp message drafts."

@@ -4,14 +4,20 @@ Allows VISION to read/write clipboard contents and translate text across languag
 """
 
 import urllib.parse
-import requests
 from typing import Optional
 from vision.tools.registry import tool
 from vision.logger import logger
 
 try:
+    import requests
+except Exception:
+    # A partially-installed requests (broken urllib3/charset_normalizer) can
+    # raise beyond ImportError at import time; don't let that kill this module.
+    requests = None
+
+try:
     import pyperclip
-except ImportError:
+except Exception:
     pyperclip = None
 
 
@@ -82,7 +88,10 @@ def translate_text(text: str, target_language: str = "Telugu") -> str:
 
     logger.info(f"[TranslationTool] Translating text to '{target_language}' ({target_code})...")
 
-    # 1. Fast Google Translate Web Endpoint
+    if requests is None:
+        return "Error: the 'requests' package is not installed; translation is unavailable."
+
+    # Google Translate web endpoint (single request, no fallback chain).
     try:
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_code}&dt=t&q={urllib.parse.quote(text)}"
         resp = requests.get(url, timeout=6)
@@ -92,7 +101,8 @@ def translate_text(text: str, target_language: str = "Telugu") -> str:
             translated_text = "".join(translated_segments)
             logger.info(f"[TranslationTool] Translation successful: '{translated_text[:60]}...'")
             return f"Translated to {target_language.title()}:\n{translated_text}"
+        logger.warning(f"[TranslationTool] Translator returned HTTP {resp.status_code} for '{target_code}'.")
     except Exception as e:
-        logger.warning(f"[TranslationTool] Fast translator failed: {e}. Trying fallback.")
+        logger.warning(f"[TranslationTool] Translator request failed: {e}")
 
     return f"Unable to complete translation at this time for '{text}'."

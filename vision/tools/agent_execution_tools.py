@@ -50,13 +50,17 @@ def get_autonomous_goal_status(plan_id: str) -> str:
     Args:
         plan_id: The unique ID of the execution plan.
     """
-    from vision.cognitive.agents.orchestrator import multi_agent_orchestrator
-    plan = multi_agent_orchestrator.get_plan(plan_id)
-    if not plan:
-        return f"No active or historical plan found with ID '{plan_id}'."
-    
-    tasks_summary = []
-    for t in plan.tasks:
-        tasks_summary.append(f"- [{t.status.value.upper()}] {t.title} (Agent: {t.agent_type})")
-    
-    return f"Plan ID: {plan.plan_id}\nGoal: {plan.goal}\nStatus: {plan.status.value}\nTasks:\n" + "\n".join(tasks_summary)
+    try:
+        from vision.cognitive.agents.orchestrator import multi_agent_orchestrator
+        plan = multi_agent_orchestrator.get_plan(plan_id)
+        if not plan:
+            return f"No active or historical plan found with ID '{plan_id}'."
+
+        tasks_summary = []
+        for t in plan.tasks:
+            tasks_summary.append(f"- [{t.status.value.upper()}] {t.title} (Agent: {t.agent_type})")
+
+        return f"Plan ID: {plan.plan_id}\nGoal: {plan.goal}\nStatus: {plan.status.value}\nTasks:\n" + "\n".join(tasks_summary)
+    except Exception as e:
+        logger.error(f"[AgentExecutionTools] Error fetching status for plan '{plan_id}': {e}")
+        return f"Error fetching autonomous goal status: {str(e)}"

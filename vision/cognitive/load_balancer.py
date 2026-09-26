@@ -4,6 +4,7 @@ persistent key health tracking across restarts, and instant failover.
 """
 
 import time
+import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Optional
 from vision.config import config
 from vision.logger import logger
@@ -12,6 +13,17 @@ from vision.cognitive.providers.groq_llm import GroqLLMProvider
 from vision.cognitive.providers.openai_compatible import OpenAICompatibleProvider
 from vision.cognitive.providers.gemini_llm import GeminiLLMProvider
 from vision.cognitive.key_manager import key_manager
+
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    """Detect a rate-limit error via the SDK status code first, then fall back
+    to substring matching (avoids both false positives from ids containing '429'
+    and false negatives when the message is worded differently)."""
+    status = getattr(e, "status_code", None) or getattr(e, "code", None)
+    if status == 429:
+        return True
+    err_str = str(e).lower()
+    return "429" in err_str or "rate_limit" in err_str or "rate limit" in err_str or "tokens per day" in err_str
 
 
 class LoadBalancer:
@@ -117,22 +129,28 @@ class LoadBalancer:
         last_error = None
 
         for provider in ranked_providers:
-            # Check availability immediately before dispatch
-            if self._is_on_cooldown(provider):
-                continue
-
+            # NOTE: do NOT skip cooled-down providers here. _select_provider_order
+            # already de-prioritizes them, but when every key is rate-limited it
+            # deliberately returns them ordered by soonest-to-recover. Skipping
+            # them here would mean *no* provider is ever attempted in that case,
+            # turning a temporary rate limit into a total outage.
             try:
                 logger.debug(f"[LoadBalancer] Routing to '{provider.name}' ({provider.model})")
-                return await provider.chat_completion(
-                    messages=messages,
-                    tools=tools,
-                    temperature=temperature,
-                    max_tokens=max_tokens
+                # Hard cap on top of each SDK's own timeout so any provider that
+                # hangs past its client timeout still triggers failover.
+                return await asyncio.wait_for(
+                    provider.chat_completion(
+                        messages=messages,
+                        tools=tools,
+                        temperature=temperature,
+                        max_tokens=max_tokens
+                    ),
+                    timeout=30,
                 )
             except Exception as e:
                 err_str = str(e)
                 # Persist rate limit to disk so next query immediately skips this key
-                if "429" in err_str or "rate_limit" in err_str or "tokens per day" in err_str:
+                if _is_rate_limit_error(e):
                     api_key = getattr(provider, "api_key", None)
                     if api_key:
                         key_manager.mark_rate_limited(api_key, err_str)
@@ -152,9 +170,11 @@ class LoadBalancer:
     ) -> AsyncGenerator[str, None]:
         """Stream tokens with failover on initial connection."""
         ranked_providers = self._select_provider_order()
+        last_error = None
         for provider in ranked_providers:
-            if self._is_on_cooldown(provider):
-                continue
+            # See chat_completion: never skip cooled-down providers here or an
+            # all-rate-limited state produces a silently empty stream.
+            yielded = False
             try:
                 async for chunk in provider.stream_chat_completion(
                     messages=messages,
@@ -162,15 +182,26 @@ class LoadBalancer:
                     temperature=temperature,
                     max_tokens=max_tokens
                 ):
+                    yielded = True
                     yield chunk
                 return
             except Exception as e:
                 err_str = str(e)
-                if "429" in err_str or "rate_limit" in err_str or "tokens per day" in err_str:
+                if _is_rate_limit_error(e):
                     api_key = getattr(provider, "api_key", None)
                     if api_key:
                         key_manager.mark_rate_limited(api_key, err_str)
                 logger.warning(f"[LoadBalancer] Stream provider '{provider.name}' failed: {e}. Failing over.")
+                last_error = e
+                if yielded:
+                    # Partial output already emitted downstream; failing over to
+                    # another provider would concatenate a second, duplicated
+                    # response onto the garbled first. Abort instead.
+                    raise RuntimeError(
+                        f"Streaming provider '{provider.name}' failed after partial output: {e}"
+                    ) from e
+
+        raise RuntimeError(f"All LLM streaming providers failed. Last error: {last_error}")
 
 
 # Global Load Balancer Singleton

@@ -143,7 +143,7 @@ async def get_system_stats():
                 "percent": cpu_overall,
                 "cores": cpu_cores,
                 "core_count": psutil.cpu_count(logical=True),
-                "frequency_ghz": round(cpu_freq.current / 1000, 2) if cpu_freq else 0
+                "frequency_ghz": round((cpu_freq.current or 0) / 1000, 2) if cpu_freq else 0
             },
             "ram": {
                 "percent": vmem.percent,
@@ -302,15 +302,22 @@ async def synthesize_speech(req: SynthesizeRequest):
 
 @router.post("/audio/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
+    # Cap upload size to avoid unbounded memory use from a single request.
+    MAX_AUDIO_BYTES = 25 * 1024 * 1024  # 25 MB
     try:
-        contents = await file.read()
+        contents = await file.read(MAX_AUDIO_BYTES + 1)
+        if len(contents) > MAX_AUDIO_BYTES:
+            raise HTTPException(status_code=413, detail="Audio upload exceeds 25 MB limit.")
         if not contents or len(contents) < 400:
             return {"text": ""}
         text = await stt.transcribe(contents, filename=file.filename)
         return {"text": text or ""}
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning(f"[STT] Transcribe endpoint warning: {e}")
-        return {"text": ""}
+        # Surface real STT failures instead of masking them as an empty 200 result.
+        logger.warning(f"[STT] Transcribe endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=f"Speech transcription failed: {e}")
 
 
 @router.post("/audio/stop")

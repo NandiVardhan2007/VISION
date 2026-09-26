@@ -8,6 +8,7 @@ and LRU capacity management.
 import json
 import hashlib
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -60,6 +61,10 @@ class CAGEngine:
 
         # L1 Memory Cache: {hash: {query, normalized_query, tokens, response, created_at, last_accessed, expires_at, category, hit_count}}
         self._l1_cache: Dict[str, Dict[str, Any]] = {}
+        # Sync tools run in a thread-pool executor (tool_registry) while the main
+        # event loop also reads/writes the cache — guard all mutations and
+        # iterate-then-persist sections with a re-entrant lock.
+        self._lock = threading.RLock()
         self.exact_hits = 0
         self.fuzzy_hits = 0
         self.misses = 0
@@ -97,8 +102,16 @@ class CAGEngine:
             return 0.0
         intersection = len(tokens1.intersection(tokens2))
         dice = (2.0 * intersection) / (len(tokens1) + len(tokens2))
-        overlap = intersection / min(len(tokens1), len(tokens2))
-        return max(dice, overlap * 0.85)
+        # The overlap boost (intersection / smaller-set-size) is aggressive: for a
+        # single-token query a single shared word yields overlap == 1.0, and
+        # 1.0 * 0.85 clears the fuzzy threshold — a false-positive cache hit
+        # (e.g. "explain python" matching a cached "python is bad"). Only apply
+        # the boost when both token sets are large enough for the overlap to be
+        # meaningful; otherwise fall back to the stricter Dice coefficient.
+        if min(len(tokens1), len(tokens2)) >= 3:
+            overlap = intersection / min(len(tokens1), len(tokens2))
+            return max(dice, overlap * 0.85)
+        return dice
 
     def _load_l2_cache(self):
         """Load persistent disk cache into memory."""
@@ -109,12 +122,14 @@ class CAGEngine:
                     now = time.time()
                     self._l1_cache = {}
                     for k, v in data.items():
-                        if v.get("expires_at", 0) > now:
+                        if (v.get("expires_at") or 0) > now:
                             norm = v.get("normalized_query") or self._normalize_query(v.get("query", ""))
                             v["normalized_query"] = norm
                             v["tokens"] = list(self._get_tokens(norm))
                             if "last_accessed" not in v:
                                 v["last_accessed"] = v.get("created_at", now)
+                            if "created_at" not in v:
+                                v["created_at"] = v.get("last_accessed", now)
                             self._l1_cache[k] = v
                 logger.info(f"[CAG] Loaded {len(self._l1_cache)} active cache entries from disk.")
             except Exception as e:
@@ -124,10 +139,10 @@ class CAGEngine:
     def _save_l2_cache(self):
         """Persist L1 cache to disk."""
         try:
-            to_save = {}
-            for k, v in self._l1_cache.items():
-                copy_v = dict(v)
-                to_save[k] = copy_v
+            # Snapshot under the lock so a concurrent put()/eviction from a tool
+            # thread cannot mutate the dict mid-serialization.
+            with self._lock:
+                to_save = {k: dict(v) for k, v in self._l1_cache.items()}
 
             with open(self.store_file, "w", encoding="utf-8") as f:
                 json.dump(to_save, f, indent=2)
@@ -165,7 +180,7 @@ class CAGEngine:
 
         # 1. Exact Match Check
         if entry:
-            if entry.get("expires_at", 0) > now:
+            if (entry.get("expires_at") or 0) > now:
                 self.exact_hits += 1
                 entry["hit_count"] = entry.get("hit_count", 0) + 1
                 entry["last_accessed"] = now
@@ -175,7 +190,7 @@ class CAGEngine:
                     "cached": True,
                     "match_type": "exact",
                     "hit_count": entry["hit_count"],
-                    "age_seconds": round(now - entry["created_at"], 1)
+                    "age_seconds": round(now - entry.get("created_at", now), 1)
                 }
             else:
                 del self._l1_cache[key]
@@ -188,7 +203,7 @@ class CAGEngine:
                 best_score = 0.0
 
                 for k, v in list(self._l1_cache.items()):
-                    if v.get("expires_at", 0) <= now:
+                    if (v.get("expires_at") or 0) <= now:
                         del self._l1_cache[k]
                         continue
 
@@ -210,7 +225,7 @@ class CAGEngine:
                         "match_type": "fuzzy",
                         "similarity": round(best_score, 2),
                         "hit_count": matched_entry["hit_count"],
-                        "age_seconds": round(now - matched_entry["created_at"], 1)
+                        "age_seconds": round(now - matched_entry.get("created_at", now), 1)
                     }
 
         self.misses += 1
@@ -246,33 +261,36 @@ class CAGEngine:
             "expires_at": now + ttl_seconds,
             "hit_count": 0
         }
-        self._l1_cache[key] = entry
-        self._evict_lru()
+        with self._lock:
+            self._l1_cache[key] = entry
+            self._evict_lru()
         self._save_l2_cache()
         logger.debug(f"[CAG] Stored cache entry '{key}' [Category: {category}, TTL: {ttl_seconds}s]")
 
     def invalidate(self, pattern: Optional[str] = None) -> int:
         """Invalidate all or matching cache entries by keyword, tag, or category."""
         if not pattern or pattern.strip().lower() in ("all", "*", ""):
-            count = len(self._l1_cache)
-            self._l1_cache.clear()
+            with self._lock:
+                count = len(self._l1_cache)
+                self._l1_cache.clear()
             self._save_l2_cache()
             logger.info(f"[CAG] Invalidated entire cache ({count} entries).")
             return count
 
         deleted = 0
         p_clean = pattern.lower().strip()
-        keys_to_del = []
-        for k, v in self._l1_cache.items():
-            query_str = v.get("query", "").lower()
-            cat_str = v.get("category", "").lower()
-            resp_str = v.get("response", "").lower()
-            if p_clean in query_str or p_clean in cat_str or p_clean in resp_str:
-                keys_to_del.append(k)
+        with self._lock:
+            keys_to_del = []
+            for k, v in list(self._l1_cache.items()):
+                query_str = v.get("query", "").lower()
+                cat_str = v.get("category", "").lower()
+                resp_str = v.get("response", "").lower()
+                if p_clean in query_str or p_clean in cat_str or p_clean in resp_str:
+                    keys_to_del.append(k)
 
-        for k in keys_to_del:
-            del self._l1_cache[k]
-            deleted += 1
+            for k in keys_to_del:
+                del self._l1_cache[k]
+                deleted += 1
 
         if deleted > 0:
             self._save_l2_cache()
@@ -285,7 +303,7 @@ class CAGEngine:
         hit_ratio = f"{(self.hits / total * 100):.1f}%" if total > 0 else "0.0%"
         
         categories: Dict[str, int] = {}
-        for v in self._l1_cache.values():
+        for v in list(self._l1_cache.values()):
             cat = v.get("category", "general")
             categories[cat] = categories.get(cat, 0) + 1
 

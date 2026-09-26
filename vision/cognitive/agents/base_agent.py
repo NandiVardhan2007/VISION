@@ -85,8 +85,11 @@ class BaseAgent(ABC):
                 })
 
                 for tc in tool_calls:
-                    func_name = tc.get("function", {}).get("name")
-                    raw_args = tc.get("function", {}).get("arguments", {})
+                    # Guard present-but-None "function" (recovered/streamed calls
+                    # can carry function: null) before .get() chaining.
+                    fn = tc.get("function") or {}
+                    func_name = fn.get("name")
+                    raw_args = fn.get("arguments") or {}
                     args = {}
                     if isinstance(raw_args, str):
                         try:
@@ -97,8 +100,14 @@ class BaseAgent(ABC):
                         args = raw_args
 
                     logger.info(f"[{self.name}] ReAct Action -> {func_name}({args})")
-                    tool_result = await tool_registry.execute(func_name, args)
-                    
+                    # Feed tool errors back to the model instead of aborting the
+                    # whole ReAct turn, so it can self-correct.
+                    try:
+                        tool_result = await tool_registry.execute(func_name, args)
+                    except Exception as e:
+                        logger.warning(f"[{self.name}] Tool '{func_name}' raised: {e}")
+                        tool_result = f"ERROR executing {func_name}: {e}"
+
                     messages.append({
                         "role": "tool",
                         "name": func_name,
@@ -107,7 +116,7 @@ class BaseAgent(ABC):
                     })
             else:
                 # Agent provided final response
-                content = response.get("content", "").strip()
+                content = (response.get("content") or "").strip()
                 return {
                     "agent": self.name,
                     "agent_type": self.agent_type,
@@ -116,11 +125,29 @@ class BaseAgent(ABC):
                     "provider": response.get("provider")
                 }
 
+        # Loop exhausted while still requesting tools: the last response's content
+        # is typically empty. Do one final tool-less call to force a text summary
+        # so the orchestrator doesn't record an empty "success".
+        try:
+            final = await self._call_llm(messages=messages, tools=None)
+            final_content = (final.get("content") or "").strip()
+            if final_content:
+                return {
+                    "agent": self.name,
+                    "agent_type": self.agent_type,
+                    "status": "success",
+                    "content": final_content,
+                    "provider": final.get("provider")
+                }
+        except Exception as e:
+            logger.warning(f"[{self.name}] Final summary call failed: {e}")
+
         return {
             "agent": self.name,
             "agent_type": self.agent_type,
-            "status": "success",
-            "content": response.get("content", "").strip(),
+            "status": "partial",
+            "content": (response.get("content") or "").strip()
+                       or f"Reached max turns ({max_turns}) without a final answer.",
             "provider": response.get("provider")
         }
 

@@ -4,23 +4,28 @@ Provides headless SSH management, server health diagnostics, live parking log in
 """
 
 import time
+import shlex
 import subprocess
 from typing import Optional, Dict, Any
 from vision.tools.registry import tool
 from vision.config import config
 from vision.logger import logger
-from vision.platform import open_terminal
+from vision.platform import open_terminal, IS_WINDOWS
 
 try:
     import paramiko
-except ImportError:
+except Exception:
+    # A partially-installed paramiko (e.g. a broken cryptography backend) can
+    # raise beyond ImportError at import; don't let that kill module import.
     paramiko = None
 
 try:
     import pyautogui
     if pyautogui:
         pyautogui.FAILSAFE = False
-except ImportError:
+except Exception:
+    # pyautogui raises non-ImportError (e.g. on a headless/no-DISPLAY host);
+    # catch broadly so the SSH tools remain importable without a GUI backend.
     pyautogui = None
 
 
@@ -73,7 +78,9 @@ def ssh_execute_command(
 
     target_host = host or config.UBUNTU_SERVER_HOST
     cwd = working_directory or config.KPR_PRINT_SERVER_PATH
-    full_cmd = f"cd {cwd} && {command}" if cwd else command
+    # Quote the directory so a path with spaces/metacharacters can't break out
+    # of the `cd` or inject extra commands (remote shell is always bash).
+    full_cmd = f"cd {shlex.quote(cwd)} && {command}" if cwd else command
 
     logger.info(f"[RemoteServer] Executing SSH command on {target_host}: '{full_cmd}'...")
     start_time = time.time()
@@ -142,13 +149,22 @@ def open_parking_logs_terminal(lines: int = 50, host: Optional[str] = None) -> s
     target_user = config.UBUNTU_SERVER_USER
     password = config.UBUNTU_SERVER_PASSWORD
 
-    ssh_cmd = f"title KPR Parking Print Server ({target_host}) && ssh {target_user}@{target_host}"
+    # CMD's `title` builtin is Windows-only; drop it on POSIX (bash -c) hosts.
+    if IS_WINDOWS:
+        ssh_cmd = f"title KPR Parking Print Server ({target_host}) && ssh {target_user}@{target_host}"
+    else:
+        ssh_cmd = f"ssh {target_user}@{target_host}"
     logger.info(f"[RemoteServer] Launching live SSH parking log terminal...")
 
     try:
         ok, msg = open_terminal(ssh_cmd)
+        # Don't blindly send keystrokes (incl. the password) if the terminal
+        # never opened — they'd land in whatever window currently has focus.
+        if not ok:
+            return f"Failed to open SSH log terminal: {msg}"
         time.sleep(1.8)
 
+        automated = False
         if pyautogui and password:
             # Enter password into the SSH prompt
             pyautogui.write(password, interval=0.03)
@@ -161,9 +177,14 @@ def open_parking_logs_terminal(lines: int = 50, host: Optional[str] = None) -> s
             pyautogui.write(log_cmd, interval=0.02)
             time.sleep(0.2)
             pyautogui.press("enter")
+            automated = True
             logger.info(f"[RemoteServer] Live parking log stream started in terminal for {target_user}@{target_host}")
 
-        return f"Opened live SSH terminal window connected to {target_host} and streaming kpr_print.log." if ok else f"Opened terminal: {msg}"
+        # Terminal launch is confirmed, but SSH auth + tail are fire-and-forget
+        # keystrokes we can't verify — report only what was actually attempted.
+        if automated:
+            return f"Opened SSH terminal to {target_host} and sent login + kpr_print.log tail keystrokes (unverified — check the window)."
+        return f"Opened terminal to SSH into {target_host}; auto-login/log-stream skipped (no GUI automation available)."
     except Exception as e:
         logger.error(f"[RemoteServer] Failed to open live log terminal: {e}")
         return f"Failed to open live log terminal: {e}"
@@ -179,7 +200,7 @@ def check_parking_logs(lines: int = 50, open_terminal: bool = True, host: Option
     """
     target_host = host or config.UBUNTU_SERVER_HOST
     log_path = config.KPR_LOG_PATH
-    
+
     # 1. Open dedicated visible terminal streaming the log in another window
     if open_terminal:
         try:
@@ -237,13 +258,13 @@ def restart_kpr_print_system(host: Optional[str] = None) -> str:
     
     cmd = (
         f"echo 'Stopping existing print server processes...' && "
-        f"pkill -f print_server_ubuntu.py || true && "
+        f"pkill -f 'print_server_ubuntu\\.py' || true && "
         f"sleep 1 && "
         f"echo 'Starting KPR print server in background...' && "
         f"nohup /home/nandu/print-server/venv/bin/python3 print_server_ubuntu.py > /dev/null 2>&1 & "
         f"sleep 2 && "
         f"echo 'Current running print processes:' && "
-        f"pgrep -fa print_server_ubuntu.py"
+        f"pgrep -fa 'print_server_ubuntu\\.py'"
     )
     return ssh_execute_command(command=cmd, working_directory=cwd, host=target_host)
 
@@ -260,13 +281,22 @@ def open_interactive_ssh_terminal(host: Optional[str] = None, username: Optional
     target_user = username or config.UBUNTU_SERVER_USER
     password = config.UBUNTU_SERVER_PASSWORD
 
-    ssh_cmd = f"title Ubuntu Server ({target_user}@{target_host}) && ssh {target_user}@{target_host}"
+    # CMD's `title` builtin is Windows-only; drop it on POSIX (bash -c) hosts.
+    if IS_WINDOWS:
+        ssh_cmd = f"title Ubuntu Server ({target_user}@{target_host}) && ssh {target_user}@{target_host}"
+    else:
+        ssh_cmd = f"ssh {target_user}@{target_host}"
     logger.info(f"[RemoteServer] Launching interactive SSH session...")
 
     try:
         ok, msg = open_terminal(ssh_cmd)
+        # Don't blindly send keystrokes (incl. the password) if the terminal
+        # never opened — they'd land in whatever window currently has focus.
+        if not ok:
+            return f"Failed to open interactive SSH terminal: {msg}"
         time.sleep(1.8)
 
+        automated = False
         if pyautogui and password:
             pyautogui.write(password, interval=0.03)
             time.sleep(0.3)
@@ -276,9 +306,14 @@ def open_interactive_ssh_terminal(host: Optional[str] = None, username: Optional
                 pyautogui.write(f"cd {initial_directory} && ls -la", interval=0.02)
                 time.sleep(0.2)
                 pyautogui.press("enter")
+            automated = True
             logger.info(f"[RemoteServer] Authenticated interactive SSH to {target_user}@{target_host}")
 
-        return f"Opened interactive terminal connected to Ubuntu server ({target_user}@{target_host})." if ok else f"Opened terminal: {msg}"
+        # Terminal launch is confirmed; the SSH login is fire-and-forget
+        # keystrokes we can't verify — soften the wording accordingly.
+        if automated:
+            return f"Opened interactive terminal and sent login keystrokes for {target_user}@{target_host} (unverified — check the window)."
+        return f"Opened terminal to SSH into {target_user}@{target_host}; auto-login skipped (no GUI automation available)."
     except Exception as e:
         logger.error(f"[RemoteServer] Interactive SSH failed: {e}")
         return f"Failed to open interactive SSH terminal: {e}"

@@ -17,6 +17,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from vision.core.engine import vision_engine, clean_text_for_speech
 from vision.perception.stt import smart_stt, is_valid_speech_text
 from vision.synthesis.cartesia_tts import cartesia_tts
+from vision.gateways.web.security import verify_ws_api_key
 from vision.logger import logger
 
 router = APIRouter()
@@ -107,7 +108,8 @@ class RealtimeSession:
         event_type = payload.get("type", "")
 
         if event_type == "session.update":
-            new_session = payload.get("session", {})
+            # `or {}` not `.get(k, {})`: clients may send "session": null explicitly.
+            new_session = payload.get("session") or {}
             if "instructions" in new_session:
                 self.instructions = new_session["instructions"]
             if "voice" in new_session:
@@ -151,7 +153,7 @@ class RealtimeSession:
             await self.send_event("input_audio_buffer.cleared")
 
         elif event_type == "conversation.item.create":
-            item = payload.get("item", {})
+            item = payload.get("item") or {}
             await self.send_event("conversation.item.created", {
                 "previous_item_id": payload.get("previous_item_id"),
                 "item": item
@@ -165,7 +167,7 @@ class RealtimeSession:
                         await self.start_response(user_text)
 
         elif event_type == "response.create":
-            response_conf = payload.get("response", {})
+            response_conf = payload.get("response") or {}
             user_text = response_conf.get("instructions", "")
             if not user_text and len(self.audio_buffer) > 0:
                 await self._commit_and_process_audio()
@@ -214,8 +216,10 @@ class RealtimeSession:
             "item_id": item_id
         })
 
-        # Convert to WAV for STT processing
-        wav_bytes = pcm16_to_wav(raw_bytes, sample_rate=16000)
+        # Convert to WAV for STT processing. Must use the session's advertised
+        # input sample rate (self.sample_rate) — hardcoding 16000 while the client
+        # streams 24 kHz PCM16 pitch/speed-shifts the audio and garbles Whisper.
+        wav_bytes = pcm16_to_wav(raw_bytes, sample_rate=self.sample_rate)
 
         # Run STT in background
         try:
@@ -250,7 +254,10 @@ class RealtimeSession:
             self._active_response_task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(self._active_response_task), timeout=0.1)
-            except Exception:
+            except (asyncio.CancelledError, Exception):
+                # CancelledError derives from BaseException (Py3.8+), so a plain
+                # `except Exception` lets the shielded task's re-raised cancellation
+                # escape the barge-in path and tear down the whole session.
                 pass
             self._active_response_task = None
 
@@ -295,6 +302,7 @@ class RealtimeSession:
         accumulated_text = ""
         sentence_buffer = ""
         sentence_delimiters = (". ", "! ", "? ", "\n")
+        streamer_task = None  # ensure it exists for the finally even if we raise early
 
         try:
             # We process through VISION engine multi-turn loop and stream
@@ -358,7 +366,8 @@ class RealtimeSession:
                 user_text=user_text,
                 session_id=self.session_id,
                 channel="realtime_ws",
-                synthesize_voice=False  # We handle direct realtime streaming deltas here
+                synthesize_voice=False,  # We handle direct realtime streaming deltas here
+                token_callback=_on_token_chunk
             )
 
             # Flush remaining sentence buffer
@@ -443,6 +452,10 @@ class RealtimeSession:
             })
         finally:
             self._is_responding = False
+            # If we raised before draining the queue, the streamer coroutine is
+            # still blocked on audio_queue.get() — cancel it so it doesn't leak.
+            if streamer_task and not streamer_task.done():
+                streamer_task.cancel()
 
     async def close(self):
         """Cleanup session resources."""
@@ -458,6 +471,9 @@ async def realtime_websocket_endpoint(websocket: WebSocket):
     OpenAI Realtime Protocol WebSocket endpoint.
     Connect here with standard OpenAI Realtime clients or Web Audio streaming frontends.
     """
+    if not verify_ws_api_key(websocket):
+        await websocket.close(code=1008)  # policy violation
+        return
     await websocket.accept()
     logger.info("[RealtimeGateway] Client connected to /v1/realtime.")
     session = RealtimeSession(websocket)

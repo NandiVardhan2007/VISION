@@ -14,13 +14,17 @@ from vision.logger import logger
 from vision.platform import (
     IS_WINDOWS,
     launch_target,
+    launch_application_command,
     find_desktop_app,
     open_path,
 )
 
 try:
     import psutil
-except ImportError:
+except Exception:
+    # psutil is a compiled C-extension; a broken/partial install can raise
+    # beyond ImportError — catch broadly so module import (and all system
+    # tools) survive a degraded psutil.
     psutil = None
 
 # Known Windows protocol and executable map
@@ -115,7 +119,16 @@ def open_application(app_name: str) -> str:
     lnk_path = _find_in_start_menu(app_name)
     if lnk_path:
         try:
-            ok, msg = open_path(str(lnk_path))
+            # On Windows the result is always a .lnk path → os.startfile handles it.
+            # On Linux/macOS find_desktop_app may return a COMMAND string
+            # (e.g. "gtk-launch foo"), not a real file — open_path would then
+            # try to xdg-open a non-existent path. Route non-Windows results
+            # through launch_application_command, which runs the command when it
+            # is one and otherwise falls back to launch_target for real paths.
+            if IS_WINDOWS:
+                ok, msg = open_path(str(lnk_path))
+            else:
+                ok, msg = launch_application_command(str(lnk_path))
             if ok:
                 logger.info(f"[SystemTool] Launched via shortcut: {lnk_path}")
                 label = getattr(lnk_path, "stem", app_name)
@@ -157,7 +170,12 @@ def get_system_stats() -> str:
         return "psutil package is not installed; system metrics unavailable."
     cpu = psutil.cpu_percent(interval=0.5)
     mem = psutil.virtual_memory()
-    battery = psutil.sensors_battery()
+    # sensors_battery() is absent on some platforms (server Linux, some macOS)
+    # and can raise, not just return None — guard both.
+    try:
+        battery = psutil.sensors_battery()
+    except Exception:
+        battery = None
     bat_str = f"{battery.percent}% ({'Plugged in' if battery.power_plugged else 'On Battery'})" if battery else "No battery detected"
     return f"CPU Usage: {cpu}%\nRAM Usage: {mem.percent}% ({mem.used // (1024*1024)}MB / {mem.total // (1024*1024)}MB)\nBattery: {bat_str}"
 

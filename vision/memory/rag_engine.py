@@ -30,9 +30,9 @@ class DocumentRAGEngine:
     """Enterprise-grade Document text extractor, chunker, and Okapi BM25 semantic retrieval engine."""
 
     SUPPORTED_EXTENSIONS = {
-        ".pdf", ".docx", ".doc", ".txt", ".md", ".csv", ".json", ".xml", ".html",
+        ".pdf", ".docx", ".txt", ".md", ".csv", ".json", ".xml", ".html",
         ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".cpp", ".c", ".h", ".cs",
-        ".sql", ".sh", ".bat", ".ps1", ".yaml", ".yml", ".log", ".ini", ".env"
+        ".sql", ".sh", ".bat", ".ps1", ".yaml", ".yml", ".log", ".ini"
     }
 
     def extract_text_from_file(self, file_path: Path) -> str:
@@ -57,8 +57,8 @@ class DocumentRAGEngine:
             except Exception as e:
                 return f"Error extracting PDF text: {e}"
 
-        # 2. DOCX extraction
-        elif ext in [".docx", ".doc"]:
+        # 2. DOCX extraction (python-docx only reads the modern .docx format)
+        elif ext == ".docx":
             if not docx:
                 return "Error: python-docx not installed. Please install python-docx."
             try:
@@ -73,6 +73,11 @@ class DocumentRAGEngine:
                 return "\n\n".join(paragraphs)
             except Exception as e:
                 return f"Error extracting DOCX text: {e}"
+
+        # Legacy binary .doc is not readable by python-docx.
+        elif ext == ".doc":
+            return ("Error: legacy '.doc' files are not supported. "
+                    "Please convert the document to '.docx' and try again.")
 
         # 3. CSV extraction
         elif ext == ".csv":
@@ -146,7 +151,10 @@ class DocumentRAGEngine:
                     
                     # If paragraph itself is larger than chunk_size, split by sliding window
                     if len(p_words) > chunk_size:
-                        for i in range(0, len(p_words), chunk_size - overlap):
+                        # max(1, ...) guards against a zero/negative step (which
+                        # range() rejects) when overlap >= chunk_size.
+                        step = max(1, chunk_size - overlap)
+                        for i in range(0, len(p_words), step):
                             sub_chunk = " ".join(p_words[i:i + chunk_size])
                             chunks.append({
                                 "index": current_chunk_idx,
@@ -199,14 +207,18 @@ class DocumentRAGEngine:
             return [(1.0, c) for c in chunks[:top_k]]
 
         N = len(chunks)
-        # Calculate document lengths & average document length
-        doc_lengths = [len(re.findall(r"\w+", c["text"])) for c in chunks]
+        # Tokenize every chunk once into a lower-cased word list. BM25 must match
+        # whole WORDS, not substrings: a naive substring test (e.g. "art" in
+        # "start"/"party") inflates both term frequency and document frequency
+        # and skews the ranking.
+        chunk_token_lists = [re.findall(r"\w+", c["text"].lower()) for c in chunks]
+        doc_lengths = [len(toks) for toks in chunk_token_lists]
         avgdl = sum(doc_lengths) / N if N > 0 else 1.0
 
-        # Calculate document frequency n(q) for each query term
+        # Calculate document frequency n(q) for each query term (whole-word match)
         doc_freq: Dict[str, int] = {}
         for term in query_terms:
-            doc_freq[term] = sum(1 for c in chunks if term in c["text"].lower())
+            doc_freq[term] = sum(1 for toks in chunk_token_lists if term in toks)
 
         # Compute BM25 scores
         scored_chunks: List[Tuple[float, Dict[str, Any]]] = []
@@ -219,7 +231,7 @@ class DocumentRAGEngine:
             score = 0.0
 
             for term in set(query_terms):
-                tf = chunk_lower.count(term)
+                tf = chunk_token_lists[i].count(term)
                 if tf == 0:
                     continue
                 nq = doc_freq.get(term, 0)
@@ -360,8 +372,10 @@ def search_documents_in_directory(query: str, directory_path: Optional[str] = No
     if directory_path:
         target_dir = _resolve_user_path(directory_path)
     else:
-        # Default to workspace root or user downloads
-        target_dir = Path("D:\\VISION")
+        # Default to the project root, derived dynamically (this file lives at
+        # vision/memory/rag_engine.py, so parents[2] is the project root). A
+        # hardcoded "D:\\VISION" broke this tool on any other machine/OS.
+        target_dir = Path(__file__).resolve().parents[2]
 
     if not target_dir or not target_dir.exists():
         return f"Error: Directory '{directory_path or target_dir}' not found."

@@ -15,6 +15,8 @@ returns a best-effort result or a clear status string.
 
 import os
 import sys
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -95,7 +97,10 @@ def launch_target(target: str) -> Tuple[bool, str]:
 
     if IS_WINDOWS:
         try:
-            os.system(f'start "" "{target}"')
+            # argv form (never os.system with an interpolated string) so a target
+            # containing quotes or shell metacharacters cannot break out of the
+            # command line and inject arbitrary commands.
+            subprocess.run(["cmd", "/c", "start", "", target], check=False)
             return True, f"Launched '{target}'."
         except Exception as e:
             return False, f"Failed to launch '{target}': {e}"
@@ -462,12 +467,16 @@ def ping_host(host: str = "8.8.8.8", count: int = 4) -> Dict[str, Any]:
         "avg": "Unknown",
         "online": False,
     }
+    # Reject anything that isn't a plain hostname or IP literal before shelling
+    # out. Combined with the argv form below this makes command injection via a
+    # crafted host (e.g. "8.8.8.8; rm -rf ~") impossible.
+    if not clean_host or not re.match(r"^[A-Za-z0-9.\-:]+$", clean_host):
+        result["output"] = f"Invalid host: {clean_host!r}"
+        return result
     try:
-        if IS_WINDOWS:
-            cmd = f"ping -n {count} {clean_host}"
-        else:
-            cmd = f"ping -c {count} {clean_host}"
-        output = subprocess.check_output(cmd, shell=True, text=True,
+        cmd = (["ping", "-n", str(count), clean_host] if IS_WINDOWS
+               else ["ping", "-c", str(count), clean_host])
+        output = subprocess.check_output(cmd, text=True,
                                           errors="ignore", timeout=30)
         result["output"] = output
         for line in output.splitlines():
@@ -488,7 +497,19 @@ def ping_host(host: str = "8.8.8.8", count: int = 4) -> Dict[str, Any]:
                         stats = line.split("=")[-1].strip()
                         avg = stats.split("/")[1] if "/" in stats else stats
                         result["avg"] = f"{avg} ms"
-        result["online"] = "0%" in result["loss"] or "0.0%" in result["loss"] or "0%" == result["loss"]
+        # Determine reachability from the parsed loss percentage. A naive
+        # substring test like ("0%" in loss) is wrong — "0%" is a substring of
+        # "100%", so a fully-dropped ping (100% loss) would be reported online.
+        # Parse the numeric percentage instead: any loss below 100% means at
+        # least one reply came back, so the host is reachable.
+        loss_match = re.search(r"([\d.]+)\s*%", str(result["loss"]))
+        if loss_match:
+            try:
+                result["online"] = float(loss_match.group(1)) < 100.0
+            except ValueError:
+                result["online"] = False
+        else:
+            result["online"] = False
     except Exception:
         result["online"] = False
     return result
@@ -503,8 +524,9 @@ def get_wifi_diagnostics() -> List[str]:
 
     if IS_WINDOWS:
         try:
-            wifi_output = subprocess.check_output("netsh wlan show interfaces",
-                                                  shell=True, text=True, errors="ignore")
+            wifi_output = subprocess.check_output(
+                ["netsh", "wlan", "show", "interfaces"],
+                text=True, errors="ignore", timeout=10)
             ssid = state = signal = radio = None
             for line in wifi_output.splitlines():
                 line = line.strip()
@@ -629,7 +651,10 @@ def launch_application_command(app_command: str) -> Tuple[bool, str]:
     exe = shutil.which(app_command.split()[0]) if not IS_WINDOWS else None
     if exe:
         try:
-            subprocess.Popen(app_command, shell=(not IS_WINDOWS))
+            # argv form (shell=False): this branch only runs on POSIX, and an
+            # LLM/user-supplied app name must not be run through the shell —
+            # shell=True here was a command-injection surface ("app; rm -rf ~").
+            subprocess.Popen(shlex.split(app_command))
             return True, f"Launched '{app_command}'."
         except Exception as e:
             return False, f"Failed to launch '{app_command}': {e}"

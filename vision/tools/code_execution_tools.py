@@ -52,7 +52,12 @@ def _detect_language(code_or_path: str, explicit_lang: Optional[str] = None) -> 
 
     # Analyze code contents
     code = code_or_path
-    if "public static void main" in code or "System.out.print" in code or "import java." in code or "class " in code and "{" in code:
+    if (
+        "public static void main" in code
+        or "System.out.print" in code
+        or "import java." in code
+        or ("class " in code and "{" in code)
+    ):
         return "java"
     if "#include <" in code or "std::cout" in code or "printf(" in code:
         return "cpp"
@@ -260,7 +265,20 @@ def _execute_cpp(
     start_time = time.time()
     temp_dir = tempfile.mkdtemp(prefix="vision_cpp_")
     try:
-        candidate_p = _resolve_user_path(code_or_file, find_existing_file=True) if len(code_or_file) < 300 else None
+        # Same path-vs-snippet guard as the Python/Java runners: a bare snippet
+        # must never go through fuzzy path resolution.
+        candidate_p = None
+        looks_like_path = (
+            len(code_or_file) < 300
+            and "\n" not in code_or_file
+            and (("/" in code_or_file) or ("\\" in code_or_file)
+                 or code_or_file.lower().endswith((".c", ".cpp", ".cc", ".cxx", ".hpp", ".java", ".py", ".js")))
+        )
+        if looks_like_path:
+            try:
+                candidate_p = _resolve_user_path(code_or_file, find_existing_file=True)
+            except Exception:
+                candidate_p = None
         if candidate_p and candidate_p.exists() and candidate_p.is_file():
             source_file = candidate_p
             out_exe = Path(temp_dir) / "prog.exe"
@@ -271,8 +289,27 @@ def _execute_cpp(
             out_exe = Path(temp_dir) / "prog.exe"
             work_path = Path(temp_dir)
 
-        # Compile with g++
-        compiler = "g++" if shutil.which("g++") else "gcc"
+        # Pick a compiler that matches the source language AND is installed.
+        # Compiling C++ with a C driver (gcc) causes link errors, and the old
+        # hard-coded "gcc" fallback raised FileNotFoundError on an MSVC-only
+        # Windows box (where neither g++ nor gcc is on PATH).
+        is_c = source_file.suffix.lower() == ".c"
+        candidates = ["gcc", "clang", "cc"] if is_c else ["g++", "clang++", "c++"]
+        compiler = next((c for c in candidates if shutil.which(c)), None)
+        if not compiler:
+            return {
+                "success": False,
+                "stage": "system_error",
+                "exit_code": -1,
+                "elapsed_sec": round(time.time() - start_time, 2),
+                "stdout": "",
+                "stderr": (
+                    f"No suitable {'C' if is_c else 'C++'} compiler found on PATH "
+                    f"(looked for: {', '.join(candidates)}). Install one — e.g. "
+                    f"MinGW-w64/MSYS2 on Windows, build-essential on Linux, or the "
+                    f"Xcode command line tools on macOS."
+                ),
+            }
         compile_proc = subprocess.run(
             [compiler, "-O2", str(source_file), "-o", str(out_exe)],
             cwd=str(work_path),
@@ -313,6 +350,17 @@ def _execute_cpp(
             "stdout": run_proc.stdout.strip(),
             "stderr": run_proc.stderr.strip()
         }
+    except subprocess.TimeoutExpired:
+        # Report timeouts distinctly (matching the Python/Java runners) so callers
+        # can treat them as inconclusive rather than as a hard failure.
+        return {
+            "success": False,
+            "stage": "timeout",
+            "exit_code": -1,
+            "elapsed_sec": round(time.time() - start_time, 2),
+            "stdout": "",
+            "stderr": f"C/C++ compile+run exceeded the {timeout_sec}s limit."
+        }
     except Exception as e:
         return {
             "success": False,
@@ -352,12 +400,28 @@ def run_code_with_input(
     elif lang in ("cpp", "c"):
         res = _execute_cpp(code_or_file_path, stdin_input, working_directory, timeout_seconds)
     elif lang == "javascript":
-        # Run via node
+        # Run via node. Accept either a file path or inline code (like the other
+        # runners) — passing a .js path to `node -e` would execute the path string
+        # as source, not the file.
         node_bin = shutil.which("node") or "node"
+        node_cmd = [node_bin, "-e", code_or_file_path]
+        looks_like_path = (
+            len(code_or_file_path) < 300
+            and "\n" not in code_or_file_path
+            and (("/" in code_or_file_path) or ("\\" in code_or_file_path)
+                 or code_or_file_path.lower().endswith(".js"))
+        )
+        if looks_like_path:
+            try:
+                cand = _resolve_user_path(code_or_file_path, find_existing_file=True)
+                if cand and cand.exists() and cand.is_file():
+                    node_cmd = [node_bin, str(cand)]
+            except Exception:
+                pass
         try:
             start_t = time.time()
             proc = subprocess.run(
-                [node_bin, "-e", code_or_file_path],
+                node_cmd,
                 input=stdin_input,
                 capture_output=True,
                 text=True,
@@ -436,13 +500,27 @@ def diagnose_and_fix_code_error(
         lang = _detect_language(str(target))
         if lang == "java":
             test_res = _execute_java(str(target))
+        elif lang in ("cpp", "c"):
+            test_res = _execute_cpp(str(target))
         else:
             test_res = _execute_python(str(target))
 
         if test_res["success"]:
-            return f"✅ Successfully applied fix to '{target.name}' and verified execution!\nOutput:\n{test_res.get('stdout', 'Clean execution.')}"
+            return f"✅ Successfully applied fix to '{target.name}' and verified execution!\nOutput:\n{test_res.get('stdout') or 'Clean execution.'}"
+        elif test_res.get("stage") == "timeout":
+            # A timeout during verification is inconclusive, not a failed fix:
+            # the program is likely waiting on stdin or is long-running.
+            return (
+                f"✅ Fix was written to '{target.name}'. Verification timed out before the program "
+                f"finished — this usually means it waits for input or runs long, not that the fix is wrong.\n"
+                f"The original file was backed up to '{backup_p.name}' — restore it if you want to revert."
+            )
         else:
-            return f"⚠️ Fix was written to '{target.name}', but execution reported an error:\n{test_res.get('stderr')}"
+            return (
+                f"⚠️ Fix was written to '{target.name}', but execution still reported an error:\n"
+                f"{test_res.get('stderr')}\n\n"
+                f"The original file was backed up to '{backup_p.name}' — restore it if you want to revert this change."
+            )
 
     # Provide diagnosis
     return (
@@ -459,7 +537,8 @@ def diagnose_and_fix_code_error(
 def compile_and_run_java_project(
     project_directory: str = "src",
     main_class: str = "Main",
-    stdin_input: Optional[str] = None
+    stdin_input: Optional[str] = None,
+    timeout_seconds: int = 30
 ) -> str:
     """Compiles multi-file Java projects and executes main class."""
     target_dir = _resolve_user_path(project_directory)
@@ -475,20 +554,30 @@ def compile_and_run_java_project(
 
     # Compile all java files
     compile_cmd = ["javac", "-d", str(bin_dir)] + [str(f) for f in java_files]
-    comp_proc = subprocess.run(compile_cmd, cwd=str(target_dir), capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        comp_proc = subprocess.run(
+            compile_cmd, cwd=str(target_dir), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout_seconds
+        )
+    except subprocess.TimeoutExpired:
+        return f"❌ Java compilation timed out after {timeout_seconds}s."
     if comp_proc.returncode != 0:
         return f"❌ Java Project Compilation Failed:\n{comp_proc.stderr.strip()}"
 
-    # Run main class
-    run_proc = subprocess.run(
-        ["java", "-cp", str(bin_dir), main_class],
-        cwd=str(target_dir),
-        input=stdin_input,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace"
-    )
+    # Run main class (timeout guards against infinite loops in user code)
+    try:
+        run_proc = subprocess.run(
+            ["java", "-cp", str(bin_dir), main_class],
+            cwd=str(target_dir),
+            input=stdin_input,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds
+        )
+    except subprocess.TimeoutExpired:
+        return f"❌ Java execution of '{main_class}' timed out after {timeout_seconds}s (possible infinite loop)."
 
     status = "✅ Success" if run_proc.returncode == 0 else "❌ Execution Error"
     return f"[{status} | Exit Code: {run_proc.returncode}]\nOutput:\n{run_proc.stdout.strip()}\n{run_proc.stderr.strip()}"

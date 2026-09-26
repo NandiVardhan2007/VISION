@@ -94,10 +94,27 @@ class VisionConfig:
         except (ValueError, TypeError):
             self.VISION_SILENCE_TIMEOUT_SEC = 0.9
 
+        # ── Wake-Word (openwakeword) ─────────────────────────
+        # Comma-separated openwakeword model names. The shipped pretrained models
+        # are "hey_jarvis", "alexa", and "hey_mycroft" — there is NO pretrained
+        # "hey_vision" model, so "Hey Jarvis" is the real default trigger phrase.
+        # To trigger on "Hey VISION" you must train/add a custom hey_vision ONNX
+        # model and list it here via the VISION_WAKE_WORDS env var.
+        self.VISION_WAKE_WORDS: List[str] = _get_list("VISION_WAKE_WORDS") or ["hey_jarvis", "alexa", "hey_mycroft"]
+        try:
+            self.VISION_WAKE_WORD_THRESHOLD: float = float(os.getenv("VISION_WAKE_WORD_THRESHOLD", "0.45"))
+        except (ValueError, TypeError):
+            self.VISION_WAKE_WORD_THRESHOLD = 0.45
+
 
         # ── Multimodal Vision & Gemini ───────────────────────
         self.GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
         self.GEMINI_API_KEYS: List[str] = _get_list("GEMINI_API_KEYS")
+
+        # ── Dedicated Sub-Agent LLM Keys (optional) ──────────
+        # When unset, the agents fall back to the shared load balancer.
+        self.EMAIL_AGENT_LLM_API: Optional[str] = os.getenv("EMAIL_AGENT_LLM_API")
+        self.SCRAPER_AGENT_LLM_API: Optional[str] = os.getenv("SCRAPER_AGENT_LLM_API")
 
         # ── Mobile & ADB Integration ─────────────────────────
         self.VISION_PHONE_IP: str = os.getenv("VISION_PHONE_IP", "192.168.1.3")
@@ -137,6 +154,17 @@ class VisionConfig:
             self.PORT: int = 8000
         self.DEBUG: bool = os.getenv("DEBUG", "False").lower() in ("true", "1", "yes")
         self.SECRET_KEY: str = os.getenv("SECRET_KEY", "vision-default-secret-key-change-me")
+        # Optional API key: when set (non-empty), the web API and WebSocket
+        # gateways require it (X-API-Key header or ?api_key= query). When unset,
+        # auth is disabled for frictionless local use.
+        self.VISION_API_KEY: Optional[str] = os.getenv("VISION_API_KEY")
+        # Comma-separated CORS allow-list. Defaults to common localhost origins.
+        # A literal "*" wildcard is honoured but forces credentials off (the
+        # wildcard + credentials combination is rejected by browsers).
+        self.VISION_ALLOWED_ORIGINS: List[str] = _get_list(
+            "VISION_ALLOWED_ORIGINS",
+            "http://localhost:8000,http://127.0.0.1:8000,http://localhost:3000,http://127.0.0.1:3000",
+        )
 
         # ── Custom Fine-Tuned Model Endpoint ─────────────────
         self.CUSTOM_MODEL_URL: str = os.getenv("CUSTOM_MODEL_URL", "http://localhost:11434/v1")

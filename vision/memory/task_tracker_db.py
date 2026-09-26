@@ -5,8 +5,11 @@ Provides persistent storage, streak tracking, category analytics, and daily/mont
 
 import sqlite3
 import os
+import re
+import calendar
+from contextlib import contextmanager
 from datetime import datetime, date
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterator
 from vision.logger import logger
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "task_tracker.sqlite")
@@ -18,11 +21,25 @@ class TaskTrackerDB:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
 
-    def _get_conn(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_conn(self) -> Iterator[sqlite3.Connection]:
+        """Yield a WAL-mode connection that commits/rolls back and always closes.
+
+        Closing is required on Windows so the .sqlite file (and its -wal/-shm
+        sidecars) are not held open, which otherwise causes WinError 32 on
+        cleanup and blocks other writers.
+        """
         conn = sqlite3.connect(self.db_path, timeout=15.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_db(self):
         with self._get_conn() as conn:
@@ -128,23 +145,53 @@ class TaskTrackerDB:
     def complete_task_by_name(self, task_name: str, day: Optional[int] = None, month: Optional[str] = None, completed: bool = True) -> Optional[Dict[str, Any]]:
         curr = self.get_current_date_info()
         day = day or curr["day"]
-        matched_id = None
+        name = (task_name or "").lower().strip()
+        if not name:
+            return None
+        like = f"%{name}%"
 
+        def _rank(title: str) -> int:
+            # 3 = exact title, 2 = whole-word hit, 1 = loose substring (the LIKE
+            # filter already guarantees at least a substring match).
+            t = (title or "").lower().strip()
+            if t == name:
+                return 3
+            if re.search(rf"\b{re.escape(name)}\b", t):
+                return 2
+            return 1
+
+        def _best(rows) -> Optional[int]:
+            # Rank rows, then within the top rank prefer the most recently created
+            # (highest id). Only auto-pick when it is an exact-title match or the
+            # top rank is unambiguous; otherwise refuse to guess and complete the
+            # wrong task (the old code always toggled an arbitrary LIKE row).
+            if not rows:
+                return None
+            scored = sorted(((r["id"], _rank(r["title"])) for r in rows),
+                            key=lambda x: (x[1], x[0]), reverse=True)
+            top_rank = scored[0][1]
+            top_ids = [rid for rid, rk in scored if rk == top_rank]
+            if top_rank == 3 or len(top_ids) == 1:
+                return top_ids[0]
+            return None
+
+        matched_id = None
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            # 1) Prefer tasks on the requested day (+ month, when given).
             query = "SELECT id, title FROM tasks WHERE LOWER(title) LIKE ? AND day = ?"
-            params = [f"%{task_name.lower().strip()}%", day]
+            params: List[Any] = [like, day]
             if month:
                 query += " AND (LOWER(month) = ? OR month_num = ?)"
                 params.extend([month.lower(), int(month) if month.isdigit() else 0])
-            
-            row = cursor.execute(query, params).fetchone()
-            if not row:
-                # Try fallback matching title anywhere
-                row = cursor.execute("SELECT id, title FROM tasks WHERE LOWER(title) LIKE ? ORDER BY id DESC LIMIT 1", (f"%{task_name.lower().strip()}%",)).fetchone()
-            
-            if row:
-                matched_id = row["id"]
+            matched_id = _best(cursor.execute(query, params).fetchall())
+
+            # 2) Fallback: search every day when nothing usable was found in scope.
+            if matched_id is None:
+                rows = cursor.execute(
+                    "SELECT id, title FROM tasks WHERE LOWER(title) LIKE ?", (like,)
+                ).fetchall()
+                matched_id = _best(rows)
 
         if matched_id is not None:
             return self.toggle_task(matched_id, completed=completed)
@@ -178,41 +225,51 @@ class TaskTrackerDB:
             """, (year, month_num, day)).fetchall()
             return [dict(r) for r in rows]
 
-    def get_tasks_for_month(self, month: Optional[str] = None, year: Optional[int] = None) -> List[Dict[str, Any]]:
-        curr = self.get_current_date_info()
-        year = year or curr["year"]
-        month_num = curr["month_num"]
-        if month:
-            months = ["January", "February", "March", "April", "May", "June", 
-                      "July", "August", "September", "October", "November", "December"]
-            if month.capitalize() in months:
-                month_num = months.index(month.capitalize()) + 1
     def ensure_daily_leetcode_tasks(self, year: Optional[int] = None, month_num: Optional[int] = None):
-        """Ensure every single day (1..31) in the month has the Daily LeetCode Priority Habit scheduled."""
+        """Ensure every day in the target month(s) has the Daily LeetCode habit scheduled.
+
+        Uses one bulk existence query + one executemany instead of a
+        SELECT-then-INSERT per day (previously up to ~730 queries per call).
+        """
         curr = self.get_current_date_info()
         year = year or curr["year"]
-        months = ["January", "February", "March", "April", "May", "June", 
+        months = ["January", "February", "March", "April", "May", "June",
                   "July", "August", "September", "October", "November", "December"]
-        
-        target_months = [month_num] if month_num else range(1, 13)
+        leetcode_title = "Daily LeetCode Problem Solving (LeetCode / CodeChef / GFG)"
+
+        target_months = [month_num] if month_num else list(range(1, 13))
         created_at = datetime.now().isoformat()
 
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            # Fetch the days that already have a LeetCode task in one query.
+            if month_num:
+                existing_rows = cursor.execute("""
+                    SELECT month_num, day FROM tasks
+                    WHERE year = ? AND month_num = ? AND LOWER(title) LIKE '%leetcode%'
+                """, (year, month_num)).fetchall()
+            else:
+                existing_rows = cursor.execute("""
+                    SELECT month_num, day FROM tasks
+                    WHERE year = ? AND LOWER(title) LIKE '%leetcode%'
+                """, (year,)).fetchall()
+            existing = {(r["month_num"], r["day"]) for r in existing_rows}
+
+            to_insert = []
             for m in target_months:
                 m_name = months[m - 1]
-                for d in range(1, 32):
-                    # Check if LeetCode task already exists for this day
-                    row = cursor.execute("""
-                        SELECT id FROM tasks 
-                        WHERE year = ? AND month_num = ? AND day = ? AND LOWER(title) LIKE '%leetcode%'
-                    """, (year, m, d)).fetchone()
+                # Use the real day count for the month/year (not a blind 1..31)
+                # so we never seed impossible dates like Feb 30 or Apr 31.
+                days_in_month = calendar.monthrange(year, m)[1]
+                for d in range(1, days_in_month + 1):
+                    if (m, d) not in existing:
+                        to_insert.append((leetcode_title, year, m_name, m, d, created_at))
 
-                    if not row:
-                        cursor.execute("""
-                            INSERT INTO tasks (title, category, priority, year, month, month_num, day, is_completed, created_at)
-                            VALUES (?, 'Coding', 'High', ?, ?, ?, ?, 0, ?)
-                        """, ("Daily LeetCode Problem Solving (LeetCode / CodeChef / GFG)", year, m_name, m, d, created_at))
+            if to_insert:
+                cursor.executemany("""
+                    INSERT INTO tasks (title, category, priority, year, month, month_num, day, is_completed, created_at)
+                    VALUES (?, 'Coding', 'High', ?, ?, ?, ?, 0, ?)
+                """, to_insert)
             conn.commit()
 
     def get_tasks_for_month(self, month: Optional[str] = None, year: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -246,62 +303,77 @@ class TaskTrackerDB:
             return [dict(r) for r in rows]
 
     def calculate_streak(self, year: Optional[int] = None) -> int:
-        """Calculate continuous consecutive completed days up to today."""
-        curr = self.get_current_date_info()
+        """Calculate continuous consecutive completed days up to today.
+
+        Aggregates all days in a single query, then walks backwards in Python
+        instead of issuing one query per day (previously up to 365 queries).
+        """
         today = date.today()
         streak = 0
-        
+
         with self._get_conn() as conn:
-            for i in range(365):
-                check_date = date.fromordinal(today.toordinal() - i)
-                rows = conn.execute("""
-                    SELECT COUNT(*) as total, SUM(is_completed) as completed 
-                    FROM tasks 
-                    WHERE year = ? AND month_num = ? AND day = ?
-                """, (check_date.year, check_date.month, check_date.day)).fetchone()
-                
-                total = rows["total"] or 0
-                completed = rows["completed"] or 0
-                
-                if total > 0:
-                    if completed == total:
-                        streak += 1
-                    else:
-                        if i == 0:
-                            continue
-                        break
+            rows = conn.execute("""
+                SELECT year, month_num, day,
+                       COUNT(*) AS total, SUM(is_completed) AS completed
+                FROM tasks
+                GROUP BY year, month_num, day
+            """).fetchall()
+
+        by_day = {
+            (r["year"], r["month_num"], r["day"]): (r["total"] or 0, r["completed"] or 0)
+            for r in rows
+        }
+
+        for i in range(365):
+            check_date = date.fromordinal(today.toordinal() - i)
+            total, completed = by_day.get((check_date.year, check_date.month, check_date.day), (0, 0))
+
+            if total > 0:
+                if completed == total:
+                    streak += 1
                 else:
                     if i == 0:
                         continue
                     break
+            else:
+                if i == 0:
+                    continue
+                break
         return streak
 
     def calculate_leetcode_streak(self, year: Optional[int] = None) -> int:
-        """Calculate consecutive days where the daily LeetCode task was solved."""
-        curr = self.get_current_date_info()
+        """Calculate consecutive days where the daily LeetCode task was solved.
+
+        Single aggregate query + Python walk (was one query per day).
+        """
         today = date.today()
         streak = 0
-        
+
         with self._get_conn() as conn:
-            for i in range(365):
-                check_date = date.fromordinal(today.toordinal() - i)
-                row = conn.execute("""
-                    SELECT is_completed FROM tasks 
-                    WHERE year = ? AND month_num = ? AND day = ? AND LOWER(title) LIKE '%leetcode%'
-                """, (check_date.year, check_date.month, check_date.day)).fetchone()
-                
-                if row:
-                    if row["is_completed"] == 1:
-                        streak += 1
-                    else:
-                        if i == 0:
-                            # Today hasn't been solved yet, don't break streak
-                            continue
-                        break
+            rows = conn.execute("""
+                SELECT year, month_num, day, MAX(is_completed) AS done
+                FROM tasks
+                WHERE LOWER(title) LIKE '%leetcode%'
+                GROUP BY year, month_num, day
+            """).fetchall()
+
+        by_day = {(r["year"], r["month_num"], r["day"]): r["done"] for r in rows}
+
+        for i in range(365):
+            check_date = date.fromordinal(today.toordinal() - i)
+            key = (check_date.year, check_date.month, check_date.day)
+            if key in by_day:
+                if by_day[key] == 1:
+                    streak += 1
                 else:
                     if i == 0:
+                        # Today hasn't been solved yet, don't break streak
                         continue
                     break
+            else:
+                if i == 0:
+                    continue
+                break
         return streak
 
     def get_dashboard_summary(self, day: Optional[int] = None, month: Optional[str] = None, year: Optional[int] = None) -> Dict[str, Any]:

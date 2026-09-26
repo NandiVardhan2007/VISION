@@ -11,11 +11,16 @@ from vision.config import config
 from vision.perception.vad import vad_detector
 from vision.logger import logger
 
+# sounddevice (PortAudio) and numpy are independent optional deps — split them so
+# a headless box without PortAudio doesn't also null numpy.
 try:
     import sounddevice as sd
-    import numpy as np
 except ImportError:
     sd = None
+
+try:
+    import numpy as np
+except ImportError:
     np = None
 
 
@@ -25,6 +30,17 @@ class AudioStreamManager:
         self.channels = channels
         self.chunk_size = chunk_size
         self._mic_error_logged = False
+        self._main_loop = None
+
+    def bind_loop(self, loop):
+        """Register the main asyncio loop.
+
+        ``record_phrase`` runs inside a worker thread (``run_in_executor``), where
+        ``asyncio.get_event_loop()`` raises and barge-in could never schedule
+        ``stop_speech()``. Capturing the main loop here lets the worker thread
+        hand the coroutine back with ``run_coroutine_threadsafe``.
+        """
+        self._main_loop = loop
 
     def is_mic_available(self) -> bool:
         if sd is None or np is None:
@@ -66,10 +82,17 @@ class AudioStreamManager:
 
         start_time = time.time()
 
+        # Clear any leftover audio in the shared VAD rolling buffer so the previous
+        # phrase's tail doesn't contaminate this turn's first speech probability.
+        vad_detector.reset_states()
+
         try:
             dev_info = sd.query_devices(kind='input')
-            native_rate = int(dev_info.get('default_samplerate', self.sample_rate))
-            native_channels = min(self.channels, dev_info.get('max_input_channels', 1))
+            # `default_samplerate`/`max_input_channels` can be present-but-None or
+            # 0 on some drivers; guard with `or` and clamp channels to >= 1 so we
+            # never open a stream with 0 channels or a None samplerate.
+            native_rate = int(dev_info.get('default_samplerate') or self.sample_rate)
+            native_channels = max(1, min(self.channels, dev_info.get('max_input_channels') or 1))
 
             pre_roll_chunks = int(0.35 * (native_rate / self.chunk_size))  # ~350ms pre-roll
             pre_roll = deque(maxlen=max(2, pre_roll_chunks))
@@ -134,12 +157,21 @@ class AudioStreamManager:
                                 from vision.core.engine import vision_engine
                                 if hasattr(vision_engine, "stop_speech"):
                                     import asyncio
-                                    try:
-                                        cur_loop = asyncio.get_event_loop()
-                                        if cur_loop.is_running():
-                                            cur_loop.create_task(vision_engine.stop_speech())
-                                    except Exception:
-                                        pass
+                                    loop = self._main_loop
+                                    if loop is None:
+                                        try:
+                                            loop = asyncio.get_event_loop()
+                                        except Exception:
+                                            loop = None
+                                    # record_phrase runs in a worker thread, so schedule
+                                    # the coroutine onto the main loop thread-safely.
+                                    if loop is not None and loop.is_running():
+                                        try:
+                                            asyncio.run_coroutine_threadsafe(
+                                                vision_engine.stop_speech(), loop
+                                            )
+                                        except Exception:
+                                            pass
                             except Exception as ex:
                                 logger.debug(f"[AudioStream] Barge-in stop notice: {ex}")
 

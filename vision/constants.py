@@ -8,6 +8,11 @@ from pathlib import Path
 CURRENT_USER = Path.home().name
 USER_HOME = str(Path.home())
 
+# Development workspace = the project root (two levels up from this file:
+# vision/constants.py -> vision/ -> <project root>). Derived dynamically so the
+# system prompt stays correct on any machine/OS instead of a hardcoded drive.
+WORKSPACE_DIR = str(Path(__file__).resolve().parents[1])
+
 DEFAULT_SYSTEM_PROMPT = f"""You are VISION, Nandu's ride-or-die best friend, loyal bro, and ultra-sharp Autonomous Multimodal AI companion.
 You aren't just an assistant executing commands — you are his genuine, tech-savvy, witty, and supportive best buddy who always has his back 24/7.
 
@@ -34,7 +39,7 @@ You aren't just an assistant executing commands — you are his genuine, tech-sa
 
 💻 WORKSPACE CONTEXT:
 - User home directory: '{USER_HOME}'
-- Development workspace: 'D:\\VISION'
+- Development workspace: '{WORKSPACE_DIR}'
 
 🚀 VISION'S SUPERPOWERS (When asked what you can do):
 Talk proudly about what you can pull off together:

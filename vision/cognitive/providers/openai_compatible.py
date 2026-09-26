@@ -17,18 +17,42 @@ except ImportError:
 
 def _sanitize_messages_for_nim(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    NVIDIA NIM strictness fix: Ensures that assistant tool_calls don't contain multiple
-    tool calls per turn, which causes NIM 500 error 'only supports single tool-calls at once'.
+    NVIDIA NIM strictness fix: NIM/OpenRouter reject an assistant turn that
+    carries multiple ``tool_calls`` ("only supports single tool-calls at once").
+    We keep only the first tool_call — but we must ALSO drop the now-orphaned
+    ``role:"tool"`` result messages for the tool_calls we removed, otherwise the
+    provider rejects the request with a 400 ("a tool message must respond to a
+    preceding message with tool_calls").
     """
-    sanitized = []
+    sanitized: List[Dict[str, Any]] = []
+    valid_tool_ids: Optional[set] = None  # None => not filtering tool results
+
+    def _tc_id(tc: Any) -> Optional[str]:
+        return tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+
     for msg in messages:
         m = dict(msg)
-        if m.get("role") == "assistant" and m.get("tool_calls"):
+        role = m.get("role")
+
+        if role == "assistant" and m.get("tool_calls"):
             tcs = m["tool_calls"]
             if isinstance(tcs, list) and len(tcs) > 1:
-                # Keep only the first tool call for strict providers
+                # Keep only the first tool call for strict providers, and record
+                # its id so we can discard result messages for the dropped calls.
                 m["tool_calls"] = [tcs[0]]
-        sanitized.append(m)
+                first_id = _tc_id(tcs[0])
+                valid_tool_ids = {first_id} if first_id else set()
+            else:
+                valid_tool_ids = None  # nothing trimmed → keep every tool result
+            sanitized.append(m)
+        elif role == "tool":
+            if valid_tool_ids is not None and m.get("tool_call_id") not in valid_tool_ids:
+                continue  # orphaned result for a tool_call we removed
+            sanitized.append(m)
+        else:
+            valid_tool_ids = None  # any other message closes the tool-result window
+            sanitized.append(m)
+
     return sanitized
 
 
@@ -47,7 +71,11 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         self.client = AsyncOpenAI(
             api_key=api_key or "not-needed",
             base_url=base_url,
-            default_headers=default_headers
+            default_headers=default_headers,
+            # Cap each request (SDK default is ~600s with internal retries) so a
+            # stalled endpoint fails over quickly instead of freezing the turn.
+            timeout=20.0,
+            max_retries=1,
         ) if AsyncOpenAI else None
 
     async def chat_completion(
@@ -79,6 +107,10 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             duration_ms = (time.time() - start_time) * 1000
             self._update_stats(duration_ms)
 
+            # NIM/OpenRouter can 200 with an empty choices list on upstream
+            # errors — raise a clear error (caught by the balancer) not IndexError.
+            if not response.choices:
+                raise RuntimeError(f"[{self.name}] empty choices in response")
             choice = response.choices[0]
             message_obj = choice.message
             tool_calls = None

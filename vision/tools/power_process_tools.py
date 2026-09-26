@@ -8,7 +8,10 @@ import time
 
 try:
     import psutil
-except ImportError:
+except Exception:
+    # psutil is a compiled C extension; a partial/broken install can raise
+    # OSError / AttributeError / RuntimeError beyond ImportError. Catch broadly
+    # so this doesn't crash module import and kill registration of all 7 tools.
     psutil = None
 
 from typing import Optional
@@ -30,19 +33,36 @@ def kill_process_by_name(process_name: str) -> str:
     if not process_name:
         return "Error: Process name is required."
 
-    target = process_name.lower().replace(".exe", "").strip()
+    target = process_name.lower().strip()
+    # Strip only a trailing ".exe" — `.replace(".exe","")` would also mangle a
+    # name that contains ".exe" mid-string.
+    if target.endswith(".exe"):
+        target = target[:-4]
     killed_count = 0
 
-    # Protect critical OS processes
-    protected = ["explorer", "csrss", "lsass", "services", "system", "svchost", "winlogon", "smss"]
+    # Protect critical OS processes (Windows + POSIX) so the exact-match guard
+    # degrades safely cross-platform — otherwise on Linux/macOS this would
+    # happily try to kill systemd/init/launchd when VISION runs as root.
+    protected = ["explorer", "csrss", "lsass", "services", "system", "svchost", "winlogon", "smss",
+                 "systemd", "init", "launchd", "kernel_task", "kthreadd"]
     if target in protected:
         return f"Error: Process '{target}' is a critical Windows system process and cannot be terminated."
 
     logger.info(f"[PowerTool] Searching to kill processes matching '{target}'...")
+    if psutil is None:
+        return "Error: psutil is not installed; cannot enumerate or terminate processes."
     for proc in psutil.process_iter(['pid', 'name']):
         try:
-            pname = proc.info['name'].lower().replace(".exe", "")
-            if target in pname or pname in target:
+            pname = (proc.info.get('name') or "").lower()
+            if pname.endswith(".exe"):
+                pname = pname[:-4]
+            if not pname:
+                continue
+            # Exact match only, and re-check the real process name against the
+            # protected list: the old substring test (target in pname / pname in
+            # target) could both over-match ("s" killing everything) and bypass
+            # the protected guard ("svchost" in "svchostmanager").
+            if target and pname == target and pname not in protected:
                 proc.kill()
                 killed_count += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):

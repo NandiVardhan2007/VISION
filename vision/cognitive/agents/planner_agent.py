@@ -73,11 +73,12 @@ class PlannerAgent(BaseAgent):
 
         logger.info(f"[PlannerAgent] Decomposing goal: '{goal}'")
         response = await self._call_llm(messages=messages)
-        content = response.get("content", "").strip()
+        content = (response.get("content") or "").strip()
 
-        # Parse JSON from response
+        # Parse JSON from response. Guard present-but-None `tasks` (LLM emits
+        # {"tasks": null}) so we fall back instead of crashing on iteration.
         plan_dict = self._parse_json(content)
-        if not plan_dict or "tasks" not in plan_dict:
+        if not plan_dict or not plan_dict.get("tasks"):
             logger.warning("[PlannerAgent] Fallback to default single-task plan.")
             return ExecutionPlan(
                 goal=goal,
@@ -94,18 +95,31 @@ class PlannerAgent(BaseAgent):
             )
 
         tasks = []
-        for idx, t in enumerate(plan_dict.get("tasks", [])):
+        for idx, t in enumerate(plan_dict.get("tasks") or []):
+            if not isinstance(t, dict):
+                continue
             task_id = t.get("id") or f"task_{idx+1}"
-            tasks.append(
-                AgentTask(
-                    id=task_id,
-                    title=t.get("title", f"Task {idx+1}"),
-                    agent_type=t.get("agent_type", "general"),
-                    description=t.get("description", ""),
-                    dependencies=t.get("dependencies", []),
-                    input_params=t.get("input_params", {})
+            try:
+                # `or default` (not `.get(k, default)`) because the LLM commonly
+                # emits explicit nulls (e.g. "dependencies": null) which pydantic
+                # will NOT coerce to [] — it raises ValidationError instead.
+                tasks.append(
+                    AgentTask(
+                        id=task_id,
+                        title=t.get("title") or f"Task {idx+1}",
+                        agent_type=t.get("agent_type") or "general",
+                        description=t.get("description") or "",
+                        dependencies=t.get("dependencies") or [],
+                        input_params=t.get("input_params") or {}
+                    )
                 )
-            )
+            except Exception as e:
+                logger.warning(f"[PlannerAgent] Skipping malformed task {task_id}: {e}")
+                continue
+
+        if not tasks:
+            # Every task was malformed — degrade to the single-task fallback.
+            tasks = [AgentTask(id="task_1", title="Execute user goal", agent_type="general", description=goal, dependencies=[])]
 
         return ExecutionPlan(
             goal=goal,
@@ -120,8 +134,9 @@ class PlannerAgent(BaseAgent):
         except Exception:
             pass
 
-        # Try regex block extraction
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        # Try regex block extraction. Greedy `.*` so nested task objects inside
+        # the fenced payload aren't truncated at the first inner `}`.
+        match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(1))

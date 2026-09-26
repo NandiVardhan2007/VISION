@@ -11,9 +11,10 @@ and bi-directional Markdown sync (MEMORIES.md).
 
 import re
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Any, Tuple, Set
+from typing import List, Dict, Optional, Any, Tuple, Set, Iterator
 from vision.logger import logger
 
 
@@ -33,10 +34,29 @@ class MAGEngine:
         self._init_db()
         self._seed_default_profile()
 
-    def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+    @contextmanager
+    def _get_connection(self) -> Iterator[sqlite3.Connection]:
+        """Yield a SQLite connection that always commits on success, rolls back
+        on error, and — critically for Windows — is always closed afterwards.
+
+        The bare ``with sqlite3.connect(...) as conn:`` idiom only commits/rolls
+        back; it never closes the connection, which leaks handles and keeps the
+        database file locked on Windows (WinError 32). Closing here fixes that.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=15.0)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            # WAL improves read/write concurrency and cuts "database is locked"
+            # errors when sync tools run in the executor alongside the main loop.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_db(self):
         """Create SQLite tables for multi-tier MAG memory and Knowledge Graph."""
@@ -114,7 +134,7 @@ class MAGEngine:
                     ("profile", f"User profile username is '{user_home.name}'.", "user,profile,name"),
                     ("hardware", "Connected physical printer is Pantum P2500 Series.", "printer,hardware,pantum"),
                     ("preference", "Default document printing format is plain A4 paper with 1.5 cm border margins.", "document,print,margin,a4"),
-                    ("workspace", f"Primary development workspace is located at 'D:\\VISION'.", "workspace,code,project"),
+                    ("workspace", f"Primary development workspace is located at '{self.project_root}'.", "workspace,code,project"),
                 ]
                 for cat, content, tags in defaults:
                     cursor.execute(
@@ -227,14 +247,27 @@ class MAGEngine:
             deleted = cursor.rowcount
 
             if deleted == 0:
-                words = [w.strip(".,'\"") for w in clean.split() if len(w.strip(".,'\"")) >= 4 and w.lower() not in {"from", "your", "that", "this", "only", "about", "with", "game", "rules"}]
+                # Fallback: match on individual significant words. Use WHOLE-WORD
+                # matching (not substring) and delete by explicit id, so
+                # "forget my printer preferences" can't wipe every row that merely
+                # contains the substring "printer" or "preferences" via an OR-any
+                # substring sweep.
+                stop = {"from", "your", "that", "this", "only", "about", "with", "game", "rules"}
+                words = [w for w in re.findall(r"\w+", clean) if len(w) >= 4 and w.lower() not in stop]
                 if words:
-                    conditions = " OR ".join(["content LIKE ? OR tags LIKE ?" for _ in words])
-                    params = []
-                    for w in words:
-                        params.extend([f"%{w}%", f"%{w}%"])
-                    cursor.execute(f"DELETE FROM semantic_memories WHERE {conditions}", params)
-                    deleted = cursor.rowcount
+                    cursor.execute("SELECT id, content, tags FROM semantic_memories")
+                    ids = [
+                        row["id"]
+                        for row in cursor.fetchall()
+                        if any(
+                            re.search(rf"\b{re.escape(w)}\b", f"{row['content']} {row['tags'] or ''}", re.IGNORECASE)
+                            for w in words
+                        )
+                    ]
+                    if ids:
+                        placeholders = ",".join(["?"] * len(ids))
+                        cursor.execute(f"DELETE FROM semantic_memories WHERE id IN ({placeholders})", ids)
+                        deleted = cursor.rowcount
 
             conn.commit()
             logger.info(f"[MAG] Deleted {deleted} memories matching '{clean}'")

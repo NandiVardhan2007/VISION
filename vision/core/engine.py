@@ -152,7 +152,9 @@ class VisionEngine:
         self.tts = cartesia_tts
         self.is_running = False
         self._current_speech_task: Optional[asyncio.Task] = None
+        self._current_tts_task: Optional[asyncio.Task] = None
         self._current_speech_gen: int = 0
+        self._daemon_tasks: List[asyncio.Task] = []
 
     async def stop_speech(self):
         """Immediately abort all active speech synthesis, streaming, and playback."""
@@ -162,7 +164,11 @@ class VisionEngine:
             self._current_speech_task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(self._current_speech_task), timeout=0.05)
-            except Exception:
+            except (asyncio.CancelledError, Exception):
+                # CancelledError derives from BaseException in 3.8+, so it is NOT
+                # caught by a bare `except Exception`. Awaiting a just-cancelled
+                # (shielded) task re-raises it; swallow it here so barge-in and
+                # the next turn are not torn down.
                 pass
             self._current_speech_task = None
 
@@ -170,23 +176,45 @@ class VisionEngine:
         """Initialize engine components and background listeners."""
         self.is_running = True
         logger.info("[VisionEngine] Initialized successfully with Full-Duplex Cartesia Neural TTS + MAG + CAG.")
-        
+
+        # Bind the running loop to the mic manager so barge-in (which runs in a
+        # worker thread) can schedule stop_speech() thread-safely.
+        try:
+            from vision.perception.audio_stream import audio_stream
+            audio_stream.bind_loop(asyncio.get_running_loop())
+        except Exception as e:
+            logger.debug(f"[VisionEngine] Could not bind audio loop: {e}")
+
         # Launch Autonomous Spoken Reminder Daemon
         async def _reminder_speaker(alert_text: str):
             logger.info(f"[VisionEngine] 🗣️ Speaking proactive reminder: '{alert_text}'")
             if self.tts:
                 try:
                     audio_bytes = await self.tts.synthesize(alert_text)
-                    audio_player.play_wav_bytes(audio_bytes, force_reset=True)
+                    # play_wav_bytes is fully synchronous (blocks until playback
+                    # completes); offload it so the whole event loop is not frozen
+                    # for the duration of every spoken reminder.
+                    await asyncio.to_thread(audio_player.play_wav_bytes, audio_bytes, True, True)
                 except Exception as e:
                     logger.error(f"[VisionEngine] Reminder voice synthesis error: {e}")
 
-        asyncio.create_task(reminder_manager.start_daemon(speech_callback=_reminder_speaker))
-        
-        # Launch Autonomous Academic Timetable Watchdog Daemon
-        from vision.tools.academic_tools import start_academic_daemon
-        asyncio.create_task(start_academic_daemon(speech_callback=_reminder_speaker))
-        
+        # Keep strong references so these long-lived daemon tasks are not
+        # garbage-collected mid-run (asyncio only holds weak refs to tasks).
+        self._daemon_tasks.append(
+            asyncio.create_task(reminder_manager.start_daemon(speech_callback=_reminder_speaker))
+        )
+
+        # Launch Autonomous Academic Timetable Watchdog Daemon. Guard the import
+        # + task launch so a failure in academic_tools (or its deps) cannot abort
+        # the whole FastAPI startup handler.
+        try:
+            from vision.tools.academic_tools import start_academic_daemon
+            self._daemon_tasks.append(
+                asyncio.create_task(start_academic_daemon(speech_callback=_reminder_speaker))
+            )
+        except Exception as e:
+            logger.warning(f"[VisionEngine] Academic daemon not started: {e}")
+
         await event_bus.publish(VisionEvents.SYSTEM_STARTED)
 
     async def speak_pipelined(
@@ -436,6 +464,10 @@ class VisionEngine:
             await text_queue.put(None)
             # Store active speech task in self._current_speech_task so barge-in can cancel it
             self._current_speech_task = playback_task
+            # Keep a strong ref to the producer too: asyncio holds only weak refs,
+            # so a still-synthesizing _tts_producer could be GC'd mid-run after
+            # this function returns.
+            self._current_tts_task = tts_task
 
             # Wait briefly for audio playback to commence so response and audio are synchronized
             if playback_started_event and not playback_started_event.is_set():

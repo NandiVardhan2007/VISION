@@ -257,7 +257,7 @@ INSTRUCTIONS:
                 temperature=0.6,
                 max_tokens=800
             )
-            return response.get("content", joined_tasks)
+            return response.get("content") or joined_tasks
         except Exception as e:
             logger.error(f"[Orchestrator] Final synthesis error: {e}")
             return joined_tasks

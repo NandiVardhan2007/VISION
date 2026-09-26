@@ -34,10 +34,24 @@ class WorkingMemory:
         if str(p) in self.recent_files:
             self.recent_files.remove(str(p))
         self.recent_files.insert(0, str(p))
-        
-        # Keep last 50 files
+
+        # Keep last 50 files (bounded). Rebuild the name index from the retained
+        # window so dropped files don't leak entries or resolve to stale paths.
         if len(self.recent_files) > 50:
             self.recent_files = self.recent_files[:50]
+            self._rebuild_index()
+
+    def _rebuild_index(self):
+        """Rebuild the name->path index from the current recent_files window.
+        Iterates oldest→newest so the most recent path wins on key collisions."""
+        self.file_index = {}
+        for fp_str in reversed(self.recent_files):
+            p = Path(fp_str)
+            norm_stem = p.stem.lower().replace(" ", "").replace("-", "").replace("_", "")
+            norm_name = p.name.lower().replace(" ", "").replace("-", "").replace("_", "")
+            self.file_index[norm_stem] = fp_str
+            self.file_index[norm_name] = fp_str
+            self.file_index[p.name.lower()] = fp_str
 
     def record_files(self, file_paths: List[str]):
         """Batch record files from listing/searching."""
@@ -55,8 +69,8 @@ class WorkingMemory:
         if norm in self.file_index:
             return self.file_index[norm]
 
-        # Fuzzy substring lookup in recent files
-        for fp_str in self.recent_files:
+        # Fuzzy substring lookup in recent files (snapshot: tool threads may mutate concurrently)
+        for fp_str in list(self.recent_files):
             p = Path(fp_str)
             p_norm = p.stem.lower().replace(" ", "").replace("-", "").replace("_", "")
             if norm in p_norm or p_norm in norm:

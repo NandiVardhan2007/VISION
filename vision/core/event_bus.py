@@ -40,14 +40,14 @@ class EventBus:
         logger.debug(f"[EventBus] Publishing event: {topic}")
         tasks = []
 
-        # Execute async listeners
+        # Execute async listeners (snapshot: handlers may (un)subscribe during dispatch)
         if topic in self._listeners:
-            for cb in self._listeners[topic]:
+            for cb in list(self._listeners[topic]):
                 tasks.append(asyncio.create_task(self._safe_execute_async(cb, data, topic)))
 
-        # Execute sync listeners
+        # Execute sync listeners (snapshot for the same reason)
         if topic in self._sync_listeners:
-            for cb in self._sync_listeners[topic]:
+            for cb in list(self._sync_listeners[topic]):
                 try:
                     cb(data)
                 except Exception as e:

@@ -9,8 +9,9 @@ import time
 import sqlite3
 import asyncio
 import re
+from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Iterator
 from vision.logger import logger
 from vision.config import config
 from vision.platform import play_chime
@@ -26,8 +27,34 @@ class ReminderManager:
         self._daemon_task: Optional[asyncio.Task] = None
         self._is_running = False
 
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection that commits/rolls back and always closes.
+
+        The daemon opens a connection every couple of seconds; the previous
+        ``with sqlite3.connect(...)`` idiom never closed them, leaking OS file
+        handles over a long-running session and locking the DB file on Windows.
+        """
+        conn = sqlite3.connect(self.db_path, timeout=15.0)
+        # WAL + NORMAL sync: the daemon polls this DB every ~2s in an executor
+        # thread while add/cancel tool calls write from other executor threads.
+        # WAL lets readers and a writer coexist, cutting "database is locked".
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS reminders (
@@ -73,7 +100,12 @@ class ReminderManager:
                     hour += 12
                 elif ampm == "am" and hour == 12:
                     hour = 0
-            
+
+            # Guard out-of-range values (e.g. a stray "at 25:70") — datetime.replace
+            # raises ValueError on hour>23 / minute>59 and would crash the parser.
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                return None
+
             target_dt = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if target_dt <= now:
                 # If time already passed today, schedule for tomorrow
@@ -100,16 +132,24 @@ class ReminderManager:
             target_timestamp = (now + timedelta(minutes=delay_minutes)).timestamp()
         elif time_str:
             target_timestamp = self.parse_time_offset(time_str)
+            # Fail loudly on an unparseable explicit time instead of silently
+            # scheduling +10 min and reporting success — "at 5:30 PM" that fails
+            # to parse must not become a 10-minute reminder.
+            if target_timestamp is None:
+                raise ValueError(
+                    f"Could not understand the time '{time_str}'. "
+                    f"Try 'in 20 minutes' or 'at 5:30 PM'."
+                )
 
         if not target_timestamp:
-            # Default to 10 minutes if unspecified
+            # No time given at all — default to 10 minutes.
             target_timestamp = (now + timedelta(minutes=10)).timestamp()
 
         target_dt = datetime.fromtimestamp(target_timestamp)
         target_iso = target_dt.isoformat()
         created_iso = now.isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO reminders (message, trigger_time_iso, trigger_timestamp, status, reminder_type, created_at)
@@ -136,7 +176,7 @@ class ReminderManager:
     def list_pending(self) -> List[Dict[str, Any]]:
         """List all active, uncompleted reminders and countdown timers."""
         now_ts = time.time()
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT id, message, trigger_time_iso, trigger_timestamp, reminder_type
@@ -168,22 +208,31 @@ class ReminderManager:
         """Cancel one or more pending reminders."""
         cancelled = []
         rows = []
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             if reminder_id is not None:
                 cursor.execute("SELECT id, message FROM reminders WHERE id = ? AND status = 'pending'", (reminder_id,))
                 rows = cursor.fetchall()
                 cursor.execute("UPDATE reminders SET status = 'cancelled' WHERE id = ?", (reminder_id,))
             elif keyword:
-                cursor.execute("SELECT id, message FROM reminders WHERE message LIKE ? AND status = 'pending'", (f"%{keyword}%",))
-                rows = cursor.fetchall()
-                cursor.execute("UPDATE reminders SET status = 'cancelled' WHERE message LIKE ? AND status = 'pending'", (f"%{keyword}%",))
-            else:
-                # Cancel the most recent
-                cursor.execute("SELECT id, message FROM reminders WHERE status = 'pending' ORDER BY id DESC LIMIT 1")
-                rows = cursor.fetchall()
+                # Whole-word match, cancel by explicit id — a substring
+                # `message LIKE '%keyword%'` sweep would cancel every partially
+                # matching pending reminder (e.g. "call" hitting "recall the...").
+                cursor.execute("SELECT id, message FROM reminders WHERE status = 'pending'")
+                rows = [
+                    r for r in cursor.fetchall()
+                    if re.search(rf"\b{re.escape(keyword)}\b", r[1] or "", re.IGNORECASE)
+                ]
                 if rows:
-                    cursor.execute("UPDATE reminders SET status = 'cancelled' WHERE id = ?", (rows[0][0],))
+                    ids = [r[0] for r in rows]
+                    placeholders = ",".join(["?"] * len(ids))
+                    cursor.execute(
+                        f"UPDATE reminders SET status = 'cancelled' WHERE id IN ({placeholders})", ids
+                    )
+            else:
+                # Neither id nor keyword given: cancel nothing rather than
+                # destructively guessing the most-recent reminder.
+                rows = []
             conn.commit()
 
         for r in rows:
@@ -195,7 +244,7 @@ class ReminderManager:
     def check_and_get_due_reminders(self) -> List[Dict[str, Any]]:
         """Fetch and mark all due reminders as completed."""
         now_ts = time.time()
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT id, message, reminder_type
@@ -215,7 +264,7 @@ class ReminderManager:
         """Mark any overdue reminders/timers from past sessions as expired so they don't trigger unexpectedly on startup."""
         now_ts = time.time()
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     UPDATE reminders
@@ -241,7 +290,10 @@ class ReminderManager:
 
         while self._is_running:
             try:
-                due_list = self.check_and_get_due_reminders()
+                # Offload the synchronous SQLite poll to a thread so a slow disk
+                # or a locked DB never stalls the shared event loop.
+                loop = asyncio.get_running_loop()
+                due_list = await loop.run_in_executor(None, self.check_and_get_due_reminders)
                 for item in due_list:
                     rem_id = item["id"]
                     msg = item["message"]

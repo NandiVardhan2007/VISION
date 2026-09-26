@@ -7,12 +7,12 @@ and requires user review/confirmation before moving items to the Recycle Bin.
 
 import os
 import subprocess
-import webbrowser
 import re
 import time
 from typing import Optional, Dict, Any, List
 from vision.tools.registry import tool
 from vision.logger import logger
+from vision.platform import IS_WINDOWS, open_url
 
 # In-memory storage for pending unconfirmed email bin actions
 _PENDING_OUTLOOK_ACTIONS: Dict[str, Any] = {
@@ -41,28 +41,30 @@ PROMOTION_KEYWORDS = [
 
 
 def _open_chrome_to_outlook(url: str = OUTLOOK_COLLEGE_URL) -> bool:
-    """Launch Google Chrome directly with Microsoft Outlook."""
-    chrome_paths = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")
-    ]
-    for cp in chrome_paths:
-        if os.path.exists(cp):
-            try:
-                subprocess.Popen([cp, url])
-                logger.info(f"[OutlookTools] Launched Chrome to {url}")
-                return True
-            except Exception as e:
-                logger.warning(f"[OutlookTools] Failed to launch Chrome via path: {e}")
+    """Launch Google Chrome directly with Microsoft Outlook (Windows), else the
+    default browser via the cross-platform helper."""
+    # The hardcoded install paths below are Windows-only; skip them entirely on
+    # Linux/macOS and go straight to the OS default browser.
+    if IS_WINDOWS:
+        chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe")
+        ]
+        for cp in chrome_paths:
+            if os.path.exists(cp):
+                try:
+                    subprocess.Popen([cp, url])
+                    logger.info(f"[OutlookTools] Launched Chrome to {url}")
+                    return True
+                except Exception as e:
+                    logger.warning(f"[OutlookTools] Failed to launch Chrome via path: {e}")
 
-    # Fallback to default browser
-    try:
-        webbrowser.open(url)
+    # Fallback to default browser (cross-platform).
+    if open_url(url):
         return True
-    except Exception as e:
-        logger.error(f"[OutlookTools] Failed to open browser: {e}")
-        return False
+    logger.error(f"[OutlookTools] Failed to open browser to {url}")
+    return False
 
 
 def _classify_email(sender: str, subject: str, snippet: str = "") -> Dict[str, Any]:
@@ -105,81 +107,45 @@ def _classify_email(sender: str, subject: str, snippet: str = "") -> Dict[str, A
 
 @tool(
     name="check_college_outlook_emails",
-    description="Opens Google Chrome to Microsoft Outlook, scans unread college emails, extracts important notices (exams, assignments, placements), and identifies promotional junk for review before moving to the bin."
+    description="Opens Google Chrome to Microsoft Outlook so you can review unread college emails. (Automated inbox reading/classification requires Microsoft Graph API access to be configured.)"
 )
 def check_college_outlook_emails(account_type: str = "college") -> str:
     """
-    Opens Chrome, navigates to Outlook, and scans unread emails.
-    Classifies important academic emails and marks promotional junk for user review.
+    Opens Chrome and navigates to Outlook Web for the user to review unread mail.
+
+    NOTE: Actually reading and classifying inbox contents requires Microsoft
+    Graph API access (or an authenticated browser-automation session), neither of
+    which is configured here. Rather than fabricate a synthetic inbox, this tool
+    opens the mailbox and reports honestly.
     """
     global _PENDING_OUTLOOK_ACTIONS
 
     target_url = OUTLOOK_COLLEGE_URL if account_type.lower() == "college" else OUTLOOK_LIVE_URL
     opened = _open_chrome_to_outlook(target_url)
 
-    # Simulated/Active Inbox Scanner
-    # In live browser session, unread emails are fetched and classified
     now_str = time.strftime("%I:%M %p, %d %b %Y")
-    
-    # Representative unread batch from current college inbox
-    sample_unread = [
-        {
-            "sender": "Aditya Examination Cell <exams@aec.edu.in>",
-            "subject": "Official Schedule: III B.Tech I Sem Mid-1 Examination Guidelines & Seating",
-            "snippet": "All III IT-A students are hereby informed that Mid-1 examinations commence shortly. Please verify your hall ticket numbers and room 221 seating."
-        },
-        {
-            "sender": "THUB Placement Cell <placements@technicalhub.io>",
-            "subject": "Drive Alert: Full Stack Developer & DSA Hiring Challenge - Registration Open",
-            "snippet": "Technical Hub invites 3rd year students for the upcoming technical round. Complete LeetCode / Coding profiles before Sunday."
-        },
-        {
-            "sender": "Coursera Specials <updates@marketing.coursera.org>",
-            "subject": "50% Off: Master Generative AI and Cloud Architectures this Weekend Only",
-            "snippet": "Upgrade your skills with our limited time spring discount across all machine learning certificates."
-        },
-        {
-            "sender": "Udemy Deals <promotions@e.udemy.com>",
-            "subject": "Flash Sale ends in 6 hours: Python, Java & Web Dev courses from $9.99",
-            "snippet": "Don't miss out on over 10,000 top rated courses on discount."
-        }
-    ]
 
-    classified_list = [_classify_email(m["sender"], m["subject"], m["snippet"]) for m in sample_unread]
-    useful = [m for m in classified_list if m["category"] == "useful"]
-    junk = [m for m in classified_list if m["category"] == "junk"]
-
+    # No live scan is available — clear any stale pending state so the
+    # confirm/review tools report the true (empty) queue.
     _PENDING_OUTLOOK_ACTIONS = {
-        "unread_count": len(classified_list),
-        "useful_emails": useful,
-        "junk_emails": junk,
-        "timestamp": now_str
+        "unread_count": 0,
+        "useful_emails": [],
+        "junk_emails": [],
+        "timestamp": now_str,
     }
 
-    # Format natural spoken response
-    response_lines = [
-        f"🚀 I opened Google Chrome to Microsoft Outlook ({target_url}).",
-        f"📬 Found {len(classified_list)} unread emails in your inbox as of {now_str}:\n"
-    ]
-
-    if useful:
-        response_lines.append("🎓 **Important College & Academic Updates:**")
-        for idx, u in enumerate(useful, 1):
-            response_lines.append(f"  {idx}. **{u['subject']}** (From: {u['sender']})")
-            if u["snippet"]:
-                response_lines.append(f"     *Note: {u['snippet']}*")
-        response_lines.append("")
-
-    if junk:
-        response_lines.append(f"🗑️ **{len(junk)} Promotional / Non-Useful Emails Detected:**")
-        for idx, j in enumerate(junk, 1):
-            response_lines.append(f"  • {j['subject']} ({j['sender']})")
-        response_lines.append("")
-        response_lines.append("⚠️ **Review Required**: Would you like me to move these promotional emails to the Recycle Bin? (Say 'Yes, move them to bin' or 'Keep them').")
-    else:
-        response_lines.append("✅ All unread emails are relevant. No promotional junk found!")
-
-    return "\n".join(response_lines)
+    if opened:
+        return (
+            f"🚀 I opened Google Chrome to Microsoft Outlook ({target_url}) at {now_str}.\n"
+            f"📬 Your unread college mail is now on screen for review.\n\n"
+            f"ℹ️ Note: I can't read or classify inbox contents automatically yet — that "
+            f"requires Microsoft Graph API access (or an authenticated browser session) to be "
+            f"configured. Once it is, I'll summarise exams/placements and flag promotional junk."
+        )
+    return (
+        f"⚠️ I couldn't open a browser to Outlook automatically. "
+        f"Please open {target_url} manually to review your unread college emails."
+    )
 
 
 @tool(

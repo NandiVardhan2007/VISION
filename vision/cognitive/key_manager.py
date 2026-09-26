@@ -7,6 +7,7 @@ exhausted keys are remembered across system restarts, and fresh keys are priorit
 import json
 import time
 import re
+import os
 import hashlib
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -51,16 +52,23 @@ class KeyStateManager:
                 self._state = {}
 
     def _save_state(self):
-        """Save persistent key state to disk."""
+        """Save persistent key state to disk atomically (tmp + replace) so a
+        crash mid-write cannot corrupt/empty the cooldown state."""
         try:
-            with open(self.state_file, "w", encoding="utf-8") as f:
+            tmp = self.state_file.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._state, f, indent=2)
+            os.replace(tmp, self.state_file)
         except Exception as e:
             logger.warning(f"[KeyManager] Failed to persist key state: {e}")
 
     def parse_retry_duration(self, err_msg: str) -> float:
         """Parse retry duration from Groq / LLM error message (e.g. '1h12m29s' or '21m6s')."""
         default_seconds = 1800.0  # 30 min default
+        # Per-minute (RPM/TPM) limits recover fast, so use a small floor; only
+        # per-day quotas warrant a long minimum cooldown.
+        is_daily = "per day" in err_msg.lower() or "tokens per day" in err_msg.lower()
+        floor = 600.0 if is_daily else 15.0
         m = re.search(r"try again in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:([\d\.]+)s)?", err_msg, re.IGNORECASE)
         if m:
             hours = float(m.group(1) or 0)
@@ -68,8 +76,8 @@ class KeyStateManager:
             seconds = float(m.group(3) or 0)
             total = (hours * 3600) + (minutes * 60) + seconds
             if total > 0:
-                # Add 2-minute safety buffer so keys aren't called right at the boundary
-                return max(600.0, total + 120.0)
+                # Add safety buffer so keys aren't called right at the boundary
+                return max(floor, total + 120.0)
         return default_seconds
 
     def mark_rate_limited(self, api_key: str, err_msg: str):
@@ -99,7 +107,7 @@ class KeyStateManager:
 
         if time.time() > entry.get("cooldown_until", 0):
             # Cooldown expired! Re-enable key
-            del self._state[key_id]
+            self._state.pop(key_id, None)
             self._save_state()
             logger.info(f"[KeyManager] Cooldown expired for key [{key_id}]. Key is now active again.")
             return True
@@ -119,7 +127,7 @@ class KeyStateManager:
         return {
             "total_rate_limited_keys": len(self._state),
             "keys_in_cooldown": {
-                k: f"{round(max(0.0, v['cooldown_until'] - time.time())/60, 1)}m remaining"
+                k: f"{round(max(0.0, v.get('cooldown_until', 0) - time.time())/60, 1)}m remaining"
                 for k, v in self._state.items()
             }
         }

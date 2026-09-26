@@ -43,7 +43,7 @@ class GeminiLLMProvider(BaseLLMProvider):
             contents = []
             for msg in messages:
                 msg_role = msg.get("role", "user")
-                content = msg.get("content", "")
+                content = msg.get("content") or ""
 
                 # Skip assistant messages that are purely tool_calls with no text
                 if msg_role == "assistant" and msg.get("tool_calls") and not content:
@@ -64,14 +64,23 @@ class GeminiLLMProvider(BaseLLMProvider):
                 generation_config=genai.types.GenerationConfig(
                     temperature=temperature,
                     max_output_tokens=max_tokens
-                )
+                ),
+                request_options={"timeout": 20}
             )
             duration_ms = (time.time() - start_time) * 1000
             self._update_stats(duration_ms)
 
+            # response.text raises ValueError when the candidate has no text part
+            # (safety/recitation block, or MAX_TOKENS with no text). Treat that as
+            # an empty reply so a blocked Gemini turn doesn't crash the balancer.
+            try:
+                text = response.text
+            except Exception:
+                text = ""
+
             return {
                 "role": "assistant",
-                "content": response.text,
+                "content": text,
                 "tool_calls": None,
                 "finish_reason": "stop",
                 "provider": self.name,
@@ -98,8 +107,23 @@ class GeminiLLMProvider(BaseLLMProvider):
         try:
             contents = []
             for msg in messages:
-                role = "user" if msg.get("role") in ["user", "system"] else "model"
-                contents.append({"role": role, "parts": [msg.get("content", "")]})
+                msg_role = msg.get("role", "user")
+                content = msg.get("content") or ""
+
+                # Skip assistant tool-call stubs with no text (mirrors chat_completion)
+                if msg_role == "assistant" and msg.get("tool_calls") and not content:
+                    continue
+
+                # Fold tool results into a user turn so Gemini sees them as input
+                if msg_role == "tool":
+                    tool_name = msg.get("name", "tool")
+                    content = f"[Tool Result from {tool_name}]: {content}"
+                    msg_role = "user"
+
+                role = "user" if msg_role in ["user", "system", "tool"] else "model"
+                if content:
+                    # Never append parts:[None] — the Gemini API rejects it.
+                    contents.append({"role": role, "parts": [content]})
 
             response = await self.client.generate_content_async(
                 contents,
@@ -107,11 +131,18 @@ class GeminiLLMProvider(BaseLLMProvider):
                 generation_config=genai.types.GenerationConfig(
                     temperature=temperature,
                     max_output_tokens=max_tokens
-                )
+                ),
+                request_options={"timeout": 20}
             )
             async for chunk in response:
-                if chunk.text:
-                    yield chunk.text
+                # .text raises on non-text/blocked chunks — skip them instead of
+                # aborting the whole stream.
+                try:
+                    chunk_text = chunk.text
+                except Exception:
+                    chunk_text = ""
+                if chunk_text:
+                    yield chunk_text
         finally:
             self.active_requests = max(0, self.active_requests - 1)
 

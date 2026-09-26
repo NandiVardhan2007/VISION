@@ -4,6 +4,7 @@ Allows VISION to compress folders into ZIP archives and extract ZIP/TAR files.
 """
 
 import os
+import gzip
 import shutil
 import zipfile
 import tarfile
@@ -28,7 +29,7 @@ def compress_to_zip(source_path: str, output_zip_name: Optional[str] = None, des
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     zip_name = output_zip_name or f"{src.name}.zip"
-    if not zip_name.endswith(".zip"):
+    if not zip_name.lower().endswith(".zip"):
         zip_name += ".zip"
 
     out_zip = dest_dir / zip_name
@@ -40,9 +41,18 @@ def compress_to_zip(source_path: str, output_zip_name: Optional[str] = None, des
                 zipf.write(src, arcname=src.name)
             else:
                 for root, dirs, files in os.walk(src):
+                    root_p = Path(root)
+                    # Preserve empty directories: os.walk yields no files for them
+                    # so they'd otherwise be dropped from the archive.
+                    if not files and not dirs:
+                        rel = root_p.relative_to(src).as_posix()
+                        if rel and rel != ".":
+                            zipf.writestr(rel.rstrip("/") + "/", "")
                     for file in files:
-                        full_p = Path(root) / file
-                        arcname = full_p.relative_to(src)
+                        full_p = root_p / file
+                        # Use forward-slash arcnames: raw Windows backslash entries
+                        # break extraction on POSIX (whole path becomes one name).
+                        arcname = full_p.relative_to(src).as_posix()
                         zipf.write(full_p, arcname=arcname)
 
         size_kb = round(out_zip.stat().st_size / 1024, 1)
@@ -75,8 +85,11 @@ def extract_zip_archive(zip_path: str, extract_to_folder: Optional[str] = None) 
     try:
         if zipfile.is_zipfile(arc):
             with zipfile.ZipFile(arc, 'r') as zipf:
+                members = zipf.namelist()
                 zipf.extractall(out_dir)
-            extracted_count = len(list(out_dir.rglob("*")))
+            # Count real files, not the archive's directory entries (names ending
+            # in '/'), and not pre-existing files in the destination dir.
+            extracted_count = sum(1 for m in members if not m.endswith("/"))
             logger.info(f"[ArchiveTool] Extracted {extracted_count} items from ZIP.")
             return f"Successfully extracted {extracted_count} items from '{arc.name}' to '{out_dir}'."
         elif tarfile.is_tarfile(arc):
@@ -88,10 +101,32 @@ def extract_zip_archive(zip_path: str, extract_to_folder: Optional[str] = None) 
                     if member_path.startswith('..') or os.path.isabs(member_path):
                         logger.warning(f"[ArchiveTool] Skipping unsafe tar member: {member.name}")
                         continue
+                    # Link members (symlink/hardlink) can escape the extraction
+                    # dir via their target even when the name looks safe. Reject
+                    # absolute or parent-escaping link targets.
+                    if member.issym() or member.islnk():
+                        link_target = member.linkname
+                        resolved = os.path.normpath(
+                            os.path.join(os.path.dirname(member_path), link_target)
+                        )
+                        if os.path.isabs(link_target) or resolved.startswith('..'):
+                            logger.warning(
+                                f"[ArchiveTool] Skipping unsafe link member: {member.name} -> {link_target}"
+                            )
+                            continue
                     safe_members.append(member)
                 tarf.extractall(out_dir, members=safe_members)
-            extracted_count = len(list(out_dir.rglob("*")))
+            extracted_count = len(safe_members)
             return f"Successfully extracted {extracted_count} items from TAR archive to '{out_dir}'."
+        elif arc.suffix.lower() == ".gz":
+            # Plain single-file gzip (e.g. 'data.json.gz'), not a tar. is_tarfile
+            # returns False for these, so decompress the single stream directly.
+            inner_name = arc.stem or f"{arc.name}.out"  # strip the .gz suffix
+            out_file = out_dir / inner_name
+            with gzip.open(arc, "rb") as gz_in, open(out_file, "wb") as f_out:
+                shutil.copyfileobj(gz_in, f_out)
+            size_kb = round(out_file.stat().st_size / 1024, 1)
+            return f"Successfully decompressed '{arc.name}' -> '{out_file}' ({size_kb} KB)."
         else:
             return f"Error: Unsupported archive format for '{arc.name}'."
     except Exception as e:

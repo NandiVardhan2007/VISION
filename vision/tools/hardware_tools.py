@@ -10,15 +10,21 @@ from vision.platform import lock_workstation, IS_WINDOWS
 
 try:
     from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-    from comtypes import CLSCTX_ALL
-except ImportError:
+except Exception:
+    # pycaw pulls in comtypes/COM at import; on non-Windows or a broken COM stack
+    # it raises OSError/NotImplementedError, not just ImportError.
     AudioUtilities = None
     IAudioEndpointVolume = None
+try:
+    from comtypes import CLSCTX_ALL
+except Exception:
     CLSCTX_ALL = None
 
 try:
     import screen_brightness_control as sbc
-except ImportError:
+except Exception:
+    # screen_brightness_control probes OS display APIs at import and can raise
+    # non-ImportError errors on unsupported/headless hosts.
     sbc = None
 
 
@@ -53,10 +59,14 @@ def set_volume(level: int) -> str:
 
     clamped_level = max(0, min(100, int(level)))
     scalar = clamped_level / 100.0
-    endpoint.SetMasterVolumeLevelScalar(scalar, None)
-    # Automatically unmute if setting positive volume
-    if clamped_level > 0 and endpoint.GetMute():
-        endpoint.SetMute(0, None)
+    try:
+        endpoint.SetMasterVolumeLevelScalar(scalar, None)
+        # Automatically unmute if setting positive volume
+        if clamped_level > 0 and endpoint.GetMute():
+            endpoint.SetMute(0, None)
+    except Exception as e:
+        logger.error(f"[HardwareTools] Failed to set volume: {e}")
+        return f"Error setting volume: {e}"
 
     logger.info(f"[HardwareTools] System volume set to {clamped_level}%")
     return f"System volume set to {clamped_level}%."
@@ -69,12 +79,18 @@ def increase_volume(step: int = 10) -> str:
     if not endpoint:
         return "Error: Audio device interface not available."
 
-    curr_scalar = endpoint.GetMasterVolumeLevelScalar()
-    curr_pct = round(curr_scalar * 100)
-    new_pct = min(100, curr_pct + int(step))
-    endpoint.SetMasterVolumeLevelScalar(new_pct / 100.0, None)
-    if endpoint.GetMute():
-        endpoint.SetMute(0, None)
+    try:
+        curr_scalar = endpoint.GetMasterVolumeLevelScalar()
+        curr_pct = round(curr_scalar * 100)
+        # Clamp both ends so a negative step can't push the scalar below 0
+        # (SetMasterVolumeLevelScalar requires 0.0–1.0).
+        new_pct = max(0, min(100, curr_pct + int(step)))
+        endpoint.SetMasterVolumeLevelScalar(new_pct / 100.0, None)
+        if endpoint.GetMute():
+            endpoint.SetMute(0, None)
+    except Exception as e:
+        logger.error(f"[HardwareTools] Failed to increase volume: {e}")
+        return f"Error adjusting volume: {e}"
 
     logger.info(f"[HardwareTools] Volume increased from {curr_pct}% to {new_pct}%")
     return f"Volume increased to {new_pct}%."
@@ -87,10 +103,15 @@ def decrease_volume(step: int = 10) -> str:
     if not endpoint:
         return "Error: Audio device interface not available."
 
-    curr_scalar = endpoint.GetMasterVolumeLevelScalar()
-    curr_pct = round(curr_scalar * 100)
-    new_pct = max(0, curr_pct - int(step))
-    endpoint.SetMasterVolumeLevelScalar(new_pct / 100.0, None)
+    try:
+        curr_scalar = endpoint.GetMasterVolumeLevelScalar()
+        curr_pct = round(curr_scalar * 100)
+        # Clamp both ends so an out-of-range step stays within 0–100.
+        new_pct = max(0, min(100, curr_pct - int(step)))
+        endpoint.SetMasterVolumeLevelScalar(new_pct / 100.0, None)
+    except Exception as e:
+        logger.error(f"[HardwareTools] Failed to decrease volume: {e}")
+        return f"Error adjusting volume: {e}"
 
     logger.info(f"[HardwareTools] Volume decreased from {curr_pct}% to {new_pct}%")
     return f"Volume decreased to {new_pct}%."
@@ -103,7 +124,11 @@ def mute_volume() -> str:
     if not endpoint:
         return "Error: Audio device interface not available."
 
-    endpoint.SetMute(1, None)
+    try:
+        endpoint.SetMute(1, None)
+    except Exception as e:
+        logger.error(f"[HardwareTools] Failed to mute: {e}")
+        return f"Error muting audio: {e}"
     logger.info("[HardwareTools] Audio output muted.")
     return "System audio muted."
 
@@ -115,7 +140,11 @@ def unmute_volume() -> str:
     if not endpoint:
         return "Error: Audio device interface not available."
 
-    endpoint.SetMute(0, None)
+    try:
+        endpoint.SetMute(0, None)
+    except Exception as e:
+        logger.error(f"[HardwareTools] Failed to unmute: {e}")
+        return f"Error unmuting audio: {e}"
     logger.info("[HardwareTools] Audio output unmuted.")
     return "System audio unmuted."
 
@@ -127,8 +156,12 @@ def get_volume_status() -> str:
     if not endpoint:
         return "Error: Audio device interface not available."
 
-    curr_pct = round(endpoint.GetMasterVolumeLevelScalar() * 100)
-    is_muted = bool(endpoint.GetMute())
+    try:
+        curr_pct = round(endpoint.GetMasterVolumeLevelScalar() * 100)
+        is_muted = bool(endpoint.GetMute())
+    except Exception as e:
+        logger.error(f"[HardwareTools] Failed to read volume status: {e}")
+        return f"Error reading volume status: {e}"
     return f"Master Volume: {curr_pct}%, Muted: {'Yes' if is_muted else 'No'}"
 
 
@@ -266,8 +299,15 @@ def get_hardware_health() -> str:
         # 1. CPU
         cpu_overall = psutil.cpu_percent(interval=0.2)
         cores = psutil.cpu_percent(interval=0.1, percpu=True)
-        cpu_freq = psutil.cpu_freq()
-        freq_str = f" @ {round(cpu_freq.current / 1000, 2)} GHz" if cpu_freq else ""
+        # cpu_freq() can raise (not only return None) on some Linux/VM hosts
+        # where the kernel frequency files are missing — guard it so a POSIX
+        # quirk can't sink the entire telemetry report.
+        try:
+            cpu_freq = psutil.cpu_freq()
+        except Exception:
+            cpu_freq = None
+        freq_val = getattr(cpu_freq, "current", None) if cpu_freq else None
+        freq_str = f" @ {round(freq_val / 1000, 2)} GHz" if freq_val else ""
         lines.append(f"• CPU Utilization: {cpu_overall}% ({len(cores)} logical cores{freq_str})")
 
         # 2. RAM
@@ -295,8 +335,12 @@ def get_hardware_health() -> str:
         if disk_lines:
             lines.append(f"• Storage: {', '.join(disk_lines)}")
 
-        # 4. Battery
-        bat = psutil.sensors_battery()
+        # 4. Battery — sensors_battery() is absent on many hosts and can raise
+        # (not just return None); guard so it can't abort the whole report.
+        try:
+            bat = psutil.sensors_battery()
+        except Exception:
+            bat = None
         if bat:
             p_state = "Plugged In" if bat.power_plugged else "Battery"
             lines.append(f"• Battery: {bat.percent}% ({p_state})")

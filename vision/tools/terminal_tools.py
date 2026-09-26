@@ -18,16 +18,27 @@ try:
     import pyautogui
     if pyautogui:
         pyautogui.FAILSAFE = False
-except ImportError:
+except Exception:
+    # pyautogui can raise beyond ImportError on a headless/no-DISPLAY host;
+    # a bare `except ImportError` would let that kill module import.
     pyautogui = None
 
-# Banned dangerous commands for host security
+# Banned dangerous commands for host security (Windows + POSIX)
 DANGEROUS_PATTERNS = [
+    # ── Windows ──────────────────────────────────────────────
     r"\bformat\s+[a-z]:",
     r"\brmdir\s+/s\s+/q\s+c:\\windows",
     r"\bdel\s+/f\s+/s\s+/q\s+c:\\windows",
     r"\bdiskpart\b",
-    r":\(\)\{\s*:\s*\|\s*:\s*&\s*\}\s*;",  # Fork bomb
+    # ── POSIX ────────────────────────────────────────────────
+    r":\(\)\{\s*:\s*\|\s*:\s*&\s*\}\s*;",              # Fork bomb
+    r"\brm\s+-\w*[rf]\w*[rf]\w*\s+(?:--no-preserve-root\s+)?(?:/|/\*|~)(?:\s|$)",  # rm -rf / , /*, ~
+    r"\brm\s+--recursive\s+--force\s+(?:/|~)(?:\s|$)",
+    r"--no-preserve-root",
+    r"\bmkfs(?:\.\w+)?\b",                              # format filesystem
+    r"\bdd\b.*\bof=/dev/(?:sd|nvme|hd|mmcblk|disk)",    # dd to a raw disk
+    r">\s*/dev/(?:sd|nvme|hd|mmcblk|disk)",             # redirect onto raw disk
+    r"\bchmod\s+-R\s+0*7*\s+/(?:\s|$)",                 # chmod -R on root
 ]
 
 
@@ -38,6 +49,17 @@ def _is_safe_command(cmd: str) -> bool:
         if re.search(pattern, cmd_lower):
             return False
     return True
+
+
+def _strip_exec_banner(out: str) -> str:
+    """execute_terminal_command prefixes a '[Exit code: N | Time: Ns]' line.
+    Strip it so composed fields (git branch/status/log) aren't polluted by the
+    banner. Error strings (which don't carry the banner) are returned as-is."""
+    out = out or ""
+    if out.startswith("[Exit code:"):
+        parts = out.split("\n", 1)
+        return parts[1].strip() if len(parts) > 1 else ""
+    return out.strip()
 
 
 @tool(name="execute_terminal_command", description="Execute a PowerShell/CMD shell command (e.g. dir, git, npm, pip, python, curl, ping, netstat, tasklist, ipconfig) and return stdout/stderr.")
@@ -154,7 +176,7 @@ def run_python_code(code: str, timeout_seconds: int = 20) -> str:
         return f"[Exit code: {process.returncode} | Time: {elapsed}s]\n{output}"
 
     except subprocess.TimeoutExpired:
-        return f"Error: Python code execution timed out after {timeout_seconds} seconds."
+        return f"Error: Python code execution timed out after {t_sec} seconds."
     except Exception as e:
         return f"Error executing Python code: {e}"
 
@@ -170,7 +192,10 @@ def git_status_and_summary(repo_path: Optional[str] = None) -> str:
     log_out = execute_terminal_command("git log -n 3 --oneline", working_directory=cwd, timeout_seconds=10)
     branch_out = execute_terminal_command("git branch --show-current", working_directory=cwd, timeout_seconds=5)
 
-    return f"Git Branch: {branch_out.strip()}\n\nModified Files:\n{status_out.strip()}\n\nRecent Commits:\n{log_out.strip()}"
+    branch = _strip_exec_banner(branch_out) or "(unknown)"
+    status = _strip_exec_banner(status_out) or "(clean — no uncommitted changes)"
+    log = _strip_exec_banner(log_out)
+    return f"Git Branch: {branch}\n\nModified Files:\n{status}\n\nRecent Commits:\n{log}"
 
 
 def _resolve_server_credentials(target: str, username_override: Optional[str] = None) -> tuple[str, str, Optional[str]]:
@@ -187,7 +212,7 @@ def _resolve_server_credentials(target: str, username_override: Optional[str] = 
         query = f"{clean_target} server ssh ip password host hyderabad kpr"
         memories = mag_engine.search_memories(query, limit=5)
         for m in memories:
-            content = m.get("content", "")
+            content = m.get("content") or ""
             # 1. Search for IP
             ip_match = re.search(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b", content)
             if ip_match and ("server" in clean_target.lower() or "ubuntu" in clean_target.lower() or "kpr" in clean_target.lower() or "hyderabad" in clean_target.lower() or clean_target in content.lower()):
@@ -217,7 +242,21 @@ def connect_to_ssh_server(server_name_or_ip: str = "ubuntu", username: Optional[
     """
     host, user, password = _resolve_server_credentials(server_name_or_ip, username)
 
-    ssh_cmd = f"title Ubuntu Server ({user}@{host}) && ssh {user}@{host}"
+    # host/user may originate from user input or MAG memory and are interpolated
+    # into a shell command line — reject anything with shell metacharacters to
+    # close a command-injection hole (e.g. host = "x; rm -rf ~").
+    _SAFE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+    if not host or not _SAFE.match(host):
+        return f"Error: refusing to connect — server host '{host}' contains unsafe characters."
+    if not user or not _SAFE.match(user):
+        return f"Error: refusing to connect — SSH username '{user}' contains unsafe characters."
+
+    # CMD's `title` builtin only exists on Windows; on POSIX it aborts the
+    # `&&` chain before ssh ever runs. Branch on the host platform.
+    if IS_WINDOWS:
+        ssh_cmd = f"title Ubuntu Server ({user}@{host}) && ssh {user}@{host}"
+    else:
+        ssh_cmd = f"ssh {user}@{host}"
     logger.info(f"[TerminalTool] Launching SSH session...")
 
     try:
@@ -229,9 +268,16 @@ def connect_to_ssh_server(server_name_or_ip: str = "ubuntu", username: Optional[
             pyautogui.write(password, interval=0.03)
             time.sleep(0.3)
             pyautogui.press("enter")
-            logger.info(f"[TerminalTool] Authenticated SSH connection to {user}@{host}")
+            logger.info(f"[TerminalTool] Sent saved password to SSH terminal for {user}@{host}")
 
-        return f"Opened terminal and connected to SSH server ({user}@{host})." if ok else f"Opened terminal: {msg}"
+        if not ok:
+            return f"Opened terminal: {msg}"
+        # We launched ssh in a detached terminal and (optionally) typed the saved
+        # password blind — we cannot confirm the handshake succeeded from here, so
+        # don't claim the connection is established.
+        typed = " and entered the saved password" if (pyautogui and password) else ""
+        return (f"Launched a terminal running 'ssh {user}@{host}'{typed}. "
+                f"Check the terminal window to confirm the connection.")
     except Exception as e:
         logger.error(f"[TerminalTool] SSH connection failed: {e}")
         return f"Failed to connect to SSH server: {e}"

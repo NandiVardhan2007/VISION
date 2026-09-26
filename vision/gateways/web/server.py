@@ -4,30 +4,43 @@ FastAPI Server and WebSocket Gateway for real-time bidirectional communication.
 
 import json
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from vision.gateways.web.routes import router as api_router
 from vision.gateways.web.realtime import router as realtime_router
+from vision.gateways.web.security import require_api_key, verify_ws_api_key, configured_api_key
 from vision.core.engine import vision_engine
 from vision.core.event_bus import event_bus
 from vision.constants import VisionEvents
+from vision.config import config
 from vision.logger import logger
 
 app = FastAPI(title="VISION Autonomous OS", version="1.0.0")
 
-# CORS middleware for local frontend development
+# CORS: an explicit allow-list is required whenever credentials are enabled —
+# the "*" wildcard + credentials combination is rejected by browsers. If the
+# user configures "*", honour it but disable credentials to stay spec-compliant.
+_origins = config.VISION_ALLOWED_ORIGINS or ["*"]
+_allow_credentials = "*" not in _origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_origins,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(api_router, prefix="/api")
+if configured_api_key() is None:
+    logger.warning(
+        "[Server] VISION_API_KEY is not set — web API and WebSockets are UNAUTHENTICATED. "
+        "Set VISION_API_KEY to require an X-API-Key header / ?api_key= for all /api and socket access."
+    )
+
+# Enforce the optional API key across every /api route (chat, tools/execute, memory, tasks…).
+app.include_router(api_router, prefix="/api", dependencies=[Depends(require_api_key)])
 app.include_router(realtime_router)
 
 
@@ -38,6 +51,9 @@ async def on_startup():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    if not verify_ws_api_key(websocket):
+        await websocket.close(code=1008)  # policy violation
+        return
     await websocket.accept()
     await event_bus.publish(VisionEvents.WEB_CLIENT_CONNECTED)
     logger.info("[WebSocket] Client connected.")
@@ -55,7 +71,16 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             raw_data = await websocket.receive_text()
-            payload = json.loads(raw_data)
+            # A single malformed frame must not tear down the whole connection —
+            # skip it and keep serving the client.
+            try:
+                payload = json.loads(raw_data)
+            except (json.JSONDecodeError, ValueError):
+                await websocket.send_text(json.dumps({"type": "error", "data": "Invalid JSON payload."}))
+                continue
+            if not isinstance(payload, dict):
+                await websocket.send_text(json.dumps({"type": "error", "data": "Payload must be a JSON object."}))
+                continue
             action = payload.get("action")
 
             if action == "chat":

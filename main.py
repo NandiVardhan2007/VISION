@@ -74,7 +74,7 @@ async def run_voice_mode():
         if vision_engine.tts:
             audio_bytes = await vision_engine.tts.synthesize(greeting)
             from vision.synthesis.player import audio_player
-            audio_player.play_wav_bytes(audio_bytes)
+            await asyncio.to_thread(audio_player.play_wav_bytes, audio_bytes, True, True)
     except Exception as e:
         logger.error(f"[Voice] Greeting synthesis error: {e}")
 
@@ -120,7 +120,7 @@ async def run_voice_mode():
                 if vision_engine.tts:
                     audio_bytes = await vision_engine.tts.synthesize(farewell)
                     from vision.synthesis.player import audio_player
-                    audio_player.play_wav_bytes(audio_bytes)
+                    await asyncio.to_thread(audio_player.play_wav_bytes, audio_bytes, True, True)
                 break
 
             # 3. Process query through LLM, execute tools, synthesize and speak back!
@@ -247,7 +247,7 @@ async def run_wakeword_mode():
                 if vision_engine.tts:
                     audio_bytes = await vision_engine.tts.synthesize(farewell)
                     from vision.synthesis.player import audio_player
-                    audio_player.play_wav_bytes(audio_bytes)
+                    await asyncio.to_thread(audio_player.play_wav_bytes, audio_bytes, True, True)
                 break
 
             # 4. Process command through LLM, execute tools, synthesize and speak back!

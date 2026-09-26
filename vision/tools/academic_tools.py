@@ -6,6 +6,7 @@ Tailored for Nandu: B.Tech III IT Section A, Room No. 221, Aditya College of Eng
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from vision.tools.registry import tool
@@ -92,8 +93,27 @@ class AcademicManager:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
 
+    @contextmanager
+    def _connect(self):
+        """Yield a sqlite connection that commits on success, rolls back on
+        error, and is ALWAYS closed. A bare `with sqlite3.connect() as conn`
+        commits but never closes the handle — on Windows that leaves the .db
+        file locked (WinError 32). timeout=15 + WAL let executor-thread tool
+        calls read/write concurrently without 'database is locked'."""
+        conn = sqlite3.connect(self.db_path, timeout=15)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS timetable (
@@ -149,25 +169,62 @@ class AcademicManager:
 
     def get_schedule_for_day(self, day_name: Optional[str] = None) -> List[Dict[str, Any]]:
         target_day = day_name.capitalize() if day_name else datetime.now().strftime("%A")
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM timetable WHERE day_of_week = ? ORDER BY start_time ASC", (target_day,))
             return [dict(row) for row in cursor.fetchall()]
 
     def get_mid_exams(self) -> List[Dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM mid_exams ORDER BY exam_date ASC")
             return [dict(row) for row in cursor.fetchall()]
 
+    def _parse_due_to_timestamp(self, due_str: str) -> float:
+        """Convert an assignment due string into an absolute epoch timestamp.
+
+        Tries explicit calendar-date formats first (e.g. '25-12-2026',
+        '2026-12-25', '25 Dec 2026'), because the natural-language
+        ``reminder_manager.parse_time_offset`` only understands *offsets* and
+        clock times — feeding it a day number like '25' makes it try
+        ``now.replace(hour=25)`` and raise ValueError. Falls back to
+        parse_time_offset for phrases like 'in 2 days'/'5:30 pm', and finally
+        defaults to 24h out.
+        """
+        s = (due_str or "").strip()
+        date_formats = (
+            "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%Y/%m/%d",
+            "%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M",
+            "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y",
+            "%d %b", "%d %B",
+        )
+        for fmt in date_formats:
+            try:
+                dt = datetime.strptime(s, fmt)
+                if "%Y" not in fmt:  # year-less format: assume current year
+                    dt = dt.replace(year=datetime.now().year)
+                return dt.timestamp()
+            except ValueError:
+                continue
+
+        try:
+            from vision.core.reminder_daemon import reminder_manager
+            ts = reminder_manager.parse_time_offset(s)
+            if ts:
+                return ts
+        except Exception as e:
+            logger.debug(f"[Academic] Due-date offset parse failed for '{s}': {e}")
+
+        return time.time() + 86400
+
     def add_assignment(self, subject: str, title: str, due_str: str, description: Optional[str] = None) -> Dict[str, Any]:
         from vision.core.reminder_daemon import reminder_manager
-        due_timestamp = reminder_manager.parse_time_offset(due_str) or (time.time() + 86400)
+        due_timestamp = self._parse_due_to_timestamp(due_str)
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO assignments (subject, title, due_date_time, due_timestamp, status, description, created_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
@@ -176,9 +233,13 @@ class AcademicManager:
             assign_id = cursor.lastrowid
             conn.commit()
 
+        # Schedule the reminder from the resolved absolute timestamp rather than
+        # re-parsing due_str (add_reminder's time_str path shares the same
+        # offset-only limitation), so calendar-dated assignments fire correctly.
+        delay = max(1, int(due_timestamp - time.time()))
         reminder_manager.add_reminder(
             message=f"Assignment Deadline: {subject} - '{title}' is due!",
-            time_str=due_str,
+            delay_seconds=delay,
             reminder_type="assignment"
         )
 
@@ -191,7 +252,7 @@ class AcademicManager:
         }
 
     def list_assignments(self, status: str = "pending") -> List[Dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             if status == "all":
@@ -201,12 +262,32 @@ class AcademicManager:
             return [dict(row) for row in cursor.fetchall()]
 
     def mark_completed(self, ident: str) -> bool:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.cursor()
             if ident.isdigit():
                 cursor.execute("UPDATE assignments SET status = 'completed' WHERE id = ?", (int(ident),))
-            else:
-                cursor.execute("UPDATE assignments SET status = 'completed' WHERE title LIKE ?", (f"%{ident}%",))
+                conn.commit()
+                return cursor.rowcount > 0
+            # Non-numeric identifier: match by title without over-completing. A bare
+            # `LIKE '%ident%'` UPDATE silently marks EVERY assignment containing the
+            # text (e.g. "essay" completes all essays). Prefer an exact (case-
+            # insensitive) title match; only fall back to a substring search when it
+            # resolves to exactly one assignment, otherwise refuse as ambiguous.
+            cursor.execute("SELECT id FROM assignments WHERE lower(title) = lower(?)", (ident,))
+            ids = [row[0] for row in cursor.fetchall()]
+            if not ids:
+                safe = ident.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                cursor.execute(
+                    "SELECT id FROM assignments WHERE title LIKE ? ESCAPE '\\'", (f"%{safe}%",)
+                )
+                ids = [row[0] for row in cursor.fetchall()]
+                if len(ids) != 1:
+                    # 0 → no match; >1 → ambiguous, don't complete the wrong ones.
+                    return False
+            placeholders = ",".join(["?"] * len(ids))
+            cursor.execute(
+                f"UPDATE assignments SET status = 'completed' WHERE id IN ({placeholders})", ids
+            )
             conn.commit()
             return cursor.rowcount > 0
 

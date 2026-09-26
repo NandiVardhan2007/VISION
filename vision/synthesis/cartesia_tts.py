@@ -66,7 +66,13 @@ class CartesiaTTS(BaseTTS):
         return self._client
 
     async def _synthesize_edge_fallback(self, text: str) -> bytes:
-        """Fallback synthesis using Microsoft Edge Neural TTS."""
+        """Fallback synthesis using Microsoft Edge Neural TTS.
+
+        Edge-TTS streams MP3 (audio-24khz-48kbitrate-mono-mp3), but the rest of
+        the pipeline (AudioPlayer.play_wav_bytes) expects WAV PCM. Returning raw
+        MP3 bytes here produced garbled/failed playback, so transcode to WAV
+        before returning.
+        """
         if not edge_tts:
             logger.error("[CartesiaTTS] edge_tts package not available for fallback.")
             return b""
@@ -77,12 +83,50 @@ class CartesiaTTS(BaseTTS):
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
                     audio_chunks.append(chunk["data"])
-            audio_bytes = b"".join(audio_chunks)
-            logger.info(f"[CartesiaTTS] Fallback to EdgeTTS synthesized {len(audio_bytes)} bytes audio.")
-            return audio_bytes
+            mp3_bytes = b"".join(audio_chunks)
+            if not mp3_bytes:
+                return b""
+
+            wav_bytes = self._mp3_to_wav(mp3_bytes)
+            if not wav_bytes:
+                logger.error(
+                    "[CartesiaTTS] Edge-TTS fallback produced MP3 that could not be "
+                    "transcoded to WAV (install a soundfile build with MPEG support, "
+                    "or pydub+ffmpeg). Skipping fallback audio to avoid garbled output."
+                )
+                return b""
+            logger.info(f"[CartesiaTTS] Fallback to EdgeTTS synthesized {len(wav_bytes)} bytes WAV audio.")
+            return wav_bytes
         except Exception as e:
             logger.error(f"[CartesiaTTS] EdgeTTS fallback synthesis failed: {e}")
             return b""
+
+    @staticmethod
+    def _mp3_to_wav(mp3_bytes: bytes) -> bytes:
+        """Decode MP3 bytes to 16-bit PCM WAV bytes. Returns b'' if no decoder works."""
+        import io
+
+        # 1. soundfile (libsndfile >= 1.1 ships MPEG/MP3 decoding)
+        try:
+            import soundfile as sf
+            data, samplerate = sf.read(io.BytesIO(mp3_bytes), dtype="int16")
+            out = io.BytesIO()
+            sf.write(out, data, samplerate, format="WAV", subtype="PCM_16")
+            return out.getvalue()
+        except Exception:
+            pass
+
+        # 2. pydub (requires ffmpeg/avlib on PATH)
+        try:
+            from pydub import AudioSegment
+            seg = AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3")
+            out = io.BytesIO()
+            seg.export(out, format="wav")
+            return out.getvalue()
+        except Exception:
+            pass
+
+        return b""
 
     async def synthesize(self, text: str, voice_id: Optional[str] = None) -> bytes:
         """Synthesize text to audio bytes using Cartesia Sonic-2 with Edge-TTS failover."""

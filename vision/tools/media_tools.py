@@ -14,11 +14,13 @@ from pathlib import Path
 from typing import Optional
 from vision.tools.registry import tool
 from vision.logger import logger
-from vision.platform import open_path, open_url, IS_WINDOWS, IS_MACOS
+from vision.platform import open_path, IS_WINDOWS, IS_MACOS
 
 try:
     import pyautogui
-except ImportError:
+except Exception:
+    # pyautogui can raise beyond ImportError on a headless/no-DISPLAY host;
+    # a bare `except ImportError` would let that kill module import.
     pyautogui = None
 
 
@@ -57,22 +59,33 @@ def _open_url_in_comet_or_browser(url: str) -> bool:
     comet_path = _get_comet_browser_path()
     if comet_path:
         try:
-            if comet_path.lower().endswith(".exe"):
+            low = comet_path.lower()
+            if low.endswith(".exe"):
                 subprocess.Popen([comet_path, url])
                 logger.info(f"[MediaTools] Launched URL in Comet Browser ({comet_path}): '{url}'")
                 return True
-            elif comet_path.lower().endswith(".lnk"):
-                # Open shortcut or pass URL
+            elif low.endswith(".app"):
+                # macOS application bundle — launch via `open -a`
+                subprocess.Popen(["open", "-a", comet_path, url])
+                logger.info(f"[MediaTools] Launched URL in Comet Browser ({comet_path}): '{url}'")
+                return True
+            elif low.endswith(".lnk"):
+                # A .lnk only launches Comet (to its home page) — it can't carry
+                # the target URL. Start the browser via the shortcut, then always
+                # navigate to the requested URL so it actually loads.
                 try:
-                    ok, _msg = open_path(comet_path)
-                    if ok:
-                        return True
+                    open_path(comet_path)
                     time.sleep(1.0)
-                    webbrowser.open(url)
-                    return True
                 except Exception:
-                    webbrowser.open(url)
-                    return True
+                    pass
+                webbrowser.open(url)
+                logger.info(f"[MediaTools] Launched Comet via shortcut and opened URL: '{url}'")
+                return True
+            elif os.access(comet_path, os.X_OK):
+                # Linux (or any) plain executable binary
+                subprocess.Popen([comet_path, url])
+                logger.info(f"[MediaTools] Launched URL in Comet Browser ({comet_path}): '{url}'")
+                return True
         except Exception as e:
             logger.warning(f"[MediaTools] Could not launch Comet executable directly ({e}), falling back to webbrowser.")
 
@@ -111,6 +124,7 @@ def play_youtube_video(query: str, fullscreen: bool = False) -> str:
         return "Error: Please specify what song, video, or topic to play on YouTube."
 
     clean_query = query.strip()
+    is_search_results = False
     if clean_query.lower() in ("youtube", "open youtube", "home", "homepage"):
         play_url = "https://www.youtube.com"
     else:
@@ -121,8 +135,9 @@ def play_youtube_video(query: str, fullscreen: bool = False) -> str:
         else:
             encoded = urllib.parse.quote(clean_query)
             play_url = f"https://www.youtube.com/results?search_query={encoded}"
+            is_search_results = True
 
-    _open_url_in_comet_or_browser(play_url)
+    used_comet = _open_url_in_comet_or_browser(play_url)
 
     # If full screen is requested immediately upon playback
     if fullscreen and pyautogui:
@@ -130,7 +145,11 @@ def play_youtube_video(query: str, fullscreen: bool = False) -> str:
         pyautogui.press("f")
         logger.info("[MediaTools] Toggled YouTube full-screen on launch.")
 
-    return f"Opened YouTube in Comet Browser and playing '{clean_query}'."
+    browser_name = "Comet Browser" if used_comet else "your default browser"
+    if is_search_results:
+        return (f"Couldn't resolve a direct video, so I opened the YouTube search "
+                f"results for '{clean_query}' in {browser_name}.")
+    return f"Opened YouTube in {browser_name} and playing '{clean_query}'."
 
 
 @tool(

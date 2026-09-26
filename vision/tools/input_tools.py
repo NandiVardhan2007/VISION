@@ -7,28 +7,42 @@ save documents, and execute keyboard shortcuts with 100% reliability.
 import time
 import subprocess
 import ctypes
-from ctypes import wintypes
 from typing import Optional, List, Dict, Any
 from vision.tools.registry import tool
 from vision.logger import logger
 from vision.platform import IS_WINDOWS
 
+# Import each optional dependency independently: a single combined try/except
+# meant that a missing pywin32 (common on non-Windows, or a partial Windows
+# install) nulled pyautogui/pyperclip too, needlessly disabling cross-platform
+# typing/clipboard automation.
 try:
     import pyautogui
+    if pyautogui:
+        pyautogui.FAILSAFE = False
+except Exception:
+    # pyautogui's import-time init can raise beyond ImportError on a headless /
+    # no-DISPLAY host; degrade the feature instead of breaking module import.
+    pyautogui = None
+
+try:
     import pyperclip
+except Exception:
+    pyperclip = None
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
     import win32gui
     import win32process
     import win32con
-    import psutil
-    if pyautogui:
-        pyautogui.FAILSAFE = False
-except ImportError:
-    pyautogui = None
-    pyperclip = None
+except Exception:
     win32gui = None
     win32process = None
     win32con = None
-    psutil = None
 
 
 APP_COMMAND_MAP = {
@@ -45,6 +59,12 @@ APP_COMMAND_MAP = {
     "vscode": "code",
     "code": "code",
 }
+
+# Exact aliases that should resolve to Notepad. A substring test like
+# ("not" in raw or "note" in raw) wrongly reroutes Notion / annotate /
+# connections / "notes app" to Notepad and then reports success typing there.
+_NOTEPAD_ALIASES = {"notepad", "notepad.exe", "notemate", "notpad",
+                    "notepade", "note", "notes"}
 
 
 # Win32 SendInput 40-byte x64 structure definitions for native Windows input
@@ -91,7 +111,7 @@ class _INPUT(ctypes.Structure):
 def _find_target_window(app_name: str) -> Optional[int]:
     """Find the best HWND of an existing open window matching app_name."""
     raw = app_name.lower().strip()
-    target = "notepad" if ("not" in raw or "note" in raw) else raw
+    target = "notepad" if raw in _NOTEPAD_ALIASES else raw
     proc_target = f"{target}.exe"
 
     # 1. Try pygetwindow if available
@@ -175,7 +195,7 @@ def _find_target_window(app_name: str) -> Optional[int]:
 def _ensure_and_focus_window(app_name: str) -> bool:
     """Focus target application window; if not running, launch it once and focus."""
     raw = app_name.lower().strip()
-    target = "notepad" if ("not" in raw or "note" in raw) else raw
+    target = "notepad" if raw in _NOTEPAD_ALIASES else raw
 
     # 1. Search for existing window
     hwnd = _find_target_window(app_name)
@@ -185,7 +205,11 @@ def _ensure_and_focus_window(app_name: str) -> bool:
         cmd = APP_COMMAND_MAP.get(target, APP_COMMAND_MAP.get(raw, raw))
         logger.info(f"[InputTool] Window '{target}' not open. Launching via '{cmd}'...")
         try:
-            subprocess.Popen(cmd, shell=True)
+            # Route through the cross-platform launcher (argv/no shell) instead of
+            # subprocess.Popen(cmd, shell=True), which was a command-injection
+            # surface for an LLM-supplied app name (e.g. "notepad & calc").
+            from vision.platform import launch_application_command
+            launch_application_command(cmd)
             for _ in range(20):
                 time.sleep(0.1)
                 hwnd = _find_target_window(app_name)
@@ -248,6 +272,20 @@ def _type_letter_by_letter(text: str, delay_per_char: float = 0.015):
     if not text:
         return
 
+    # SendInput / ctypes.windll is Windows-only (windll doesn't exist on
+    # Linux/macOS). On POSIX go straight to the clipboard-paste fallback rather
+    # than raising AttributeError inside the loop.
+    if not IS_WINDOWS:
+        # POSIX: prefer clipboard paste, but when pyperclip is unavailable fall
+        # back to pyautogui's own cross-platform typewrite — otherwise nothing
+        # was typed yet the caller still reported success.
+        if pyperclip and pyautogui:
+            pyperclip.copy(text)
+            pyautogui.hotkey("ctrl", "v")
+        elif pyautogui:
+            pyautogui.write(text, interval=0.005)
+        return
+
     try:
         user32 = ctypes.windll.user32
         for char in text:
@@ -264,11 +302,17 @@ def _type_letter_by_letter(text: str, delay_per_char: float = 0.015):
                 user32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(_INPUT))
                 time.sleep(0.02)
             else:
-                code = ord(char)
-                inp_down = _INPUT(type=1, u=_INPUT_UNION(ki=_KEYBDINPUT(wVk=0, wScan=code, dwFlags=4, time=0, dwExtraInfo=None)))
-                inp_up = _INPUT(type=1, u=_INPUT_UNION(ki=_KEYBDINPUT(wVk=0, wScan=code, dwFlags=4 | 2, time=0, dwExtraInfo=None)))
-                user32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(_INPUT))
-                user32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(_INPUT))
+                # Send each UTF-16 code unit. wScan is 16-bit, so a raw ord()
+                # for an astral char (>0xFFFF, e.g. emoji) would wrap mod 65536
+                # and type the wrong glyph; emitting the surrogate pair as two
+                # KEYEVENTF_UNICODE events types it correctly.
+                utf16 = char.encode("utf-16-le")
+                for i in range(0, len(utf16), 2):
+                    code = utf16[i] | (utf16[i + 1] << 8)
+                    inp_down = _INPUT(type=1, u=_INPUT_UNION(ki=_KEYBDINPUT(wVk=0, wScan=code, dwFlags=4, time=0, dwExtraInfo=None)))
+                    inp_up = _INPUT(type=1, u=_INPUT_UNION(ki=_KEYBDINPUT(wVk=0, wScan=code, dwFlags=4 | 2, time=0, dwExtraInfo=None)))
+                    user32.SendInput(1, ctypes.byref(inp_down), ctypes.sizeof(_INPUT))
+                    user32.SendInput(1, ctypes.byref(inp_up), ctypes.sizeof(_INPUT))
                 if delay_per_char > 0:
                     time.sleep(delay_per_char)
     except Exception as e:
@@ -293,11 +337,18 @@ def type_text_into_application(text: str, target_app: Optional[str] = "Notepad",
     if not text:
         return "Error: Text content to type is required."
 
+    if not pyautogui:
+        return ("Error: desktop input automation is unavailable (pyautogui not "
+                "installed). Install pyautogui (and pyperclip for paste mode) to "
+                "type into applications.")
+
     if pyautogui:
         pyautogui.FAILSAFE = False
 
     app = target_app or "Notepad"
-    _ensure_and_focus_window(app)
+    if not _ensure_and_focus_window(app):
+        return (f"Error: could not open or focus '{app}'. Text was not typed to "
+                f"avoid sending it to the wrong window.")
     time.sleep(0.3)
 
     # For Notepad: press Ctrl+N to create a fresh new document before writing,
@@ -315,7 +366,10 @@ def type_text_into_application(text: str, target_app: Optional[str] = "Notepad",
                     if win32gui.IsWindowVisible(hwnd):
                         cls = win32gui.GetClassName(hwnd)
                         title = win32gui.GetWindowText(hwnd).lower()
-                        if cls == "#32770" or "save" in title or "notepad" in title and "want to save" in title:
+                        # Must be a dialog (#32770) AND look like a save prompt.
+                        # Without the parentheses `and` bound tighter than `or`,
+                        # so a bare `cls == "#32770"` matched every dialog box.
+                        if cls == "#32770" and ("save" in title or "want to save" in title):
                             dialog_hwnd = hwnd
                 try:
                     win32gui.EnumWindows(_find_dialog, None)
@@ -338,12 +392,13 @@ def type_text_into_application(text: str, target_app: Optional[str] = "Notepad",
     # Clipboard paste guarantees 100% zero dropped characters, no repeated keys, and perfect formatting
     if typing_mode in ["auto", "paste"] or len(text) > 25 or "\n" in text:
         if pyperclip and pyautogui:
+            old_clipboard = None
             try:
                 # Save previous clipboard state
                 try:
                     old_clipboard = pyperclip.paste()
                 except Exception:
-                    old_clipboard = ""
+                    old_clipboard = None
 
                 pyperclip.copy(text)
                 time.sleep(0.1)
@@ -355,6 +410,16 @@ def type_text_into_application(text: str, target_app: Optional[str] = "Notepad",
                 return f"Successfully typed text into {app}."
             except Exception as e:
                 logger.warning(f"[InputTool] Clipboard paste failed, falling back to simulated keystrokes: {e}")
+            finally:
+                # Restore the user's previous clipboard so we don't silently
+                # clobber whatever they had copied. Only if the paste stage was
+                # reached (old_clipboard captured) to avoid overwriting with junk.
+                if old_clipboard is not None:
+                    try:
+                        time.sleep(0.05)
+                        pyperclip.copy(old_clipboard)
+                    except Exception:
+                        pass
 
     # Fallback to simulated keystrokes with safe delay
     _type_letter_by_letter(text, delay_per_char=0.015)
@@ -417,7 +482,9 @@ def save_active_document(file_name: str = "note.txt", folder: str = "Downloads",
         pyautogui.FAILSAFE = False
 
     app = target_app or "Notepad"
-    _ensure_and_focus_window(app)
+    if not _ensure_and_focus_window(app):
+        return (f"Error: could not open or focus '{app}'. Save aborted to avoid "
+                f"acting on the wrong window.")
     time.sleep(0.3)
 
     # Resolve destination path
@@ -430,6 +497,7 @@ def save_active_document(file_name: str = "note.txt", folder: str = "Downloads",
 
     # 1. First, extract text from editor via Ctrl+A -> Ctrl+C (or direct Win32) to ensure we have a direct file backup
     doc_content = ""
+    old_clip = None
     if pyperclip and pyautogui:
         try:
             old_clip = pyperclip.paste()
@@ -486,5 +554,20 @@ def save_active_document(file_name: str = "note.txt", folder: str = "Downloads",
         except Exception as e:
             logger.warning(f"[InputTool] Direct file save error: {e}")
 
-    logger.info(f"[InputTool] Saved active document as '{full_path}'")
-    return f"Successfully saved active document to '{full_path}'."
+    # Restore the user's original clipboard contents (we clobbered it with the
+    # document text and/or the save path during the Ctrl+C / paste steps).
+    if old_clip is not None and pyperclip:
+        try:
+            pyperclip.copy(old_clip)
+        except Exception:
+            pass
+
+    # Report success only if the destination file actually exists on disk.
+    import os as _os
+    if _os.path.exists(full_path):
+        logger.info(f"[InputTool] Saved active document as '{full_path}'")
+        return f"Successfully saved active document to '{full_path}'."
+
+    return (f"Error: could not verify the document was saved to '{full_path}'. "
+            "The application may not have been focused, or desktop automation "
+            "(pyautogui/pyperclip) is unavailable.")
