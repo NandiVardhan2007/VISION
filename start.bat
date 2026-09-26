@@ -1,5 +1,10 @@
 @echo off
-title VISION Autonomous AI Voice & OS System
+setlocal EnableExtensions
+title VISION Autonomous AI Voice ^& OS System
+
+:: Always run from the script's own folder so relative paths (.venv, main.py)
+:: resolve no matter where the launcher is invoked from.
+cd /d "%~dp0"
 cls
 
 echo ===================================================
@@ -7,14 +12,45 @@ echo           VISION AI - SYSTEM LAUNCHER
 echo ===================================================
 echo.
 
-:: Detect Python executable in .venv or system PATH
+:: ── Resolve a WORKING Python interpreter ─────────────────────────
+:: A .venv can exist yet be broken if the base Python it was built on was
+:: uninstalled/moved (its python.exe is only a stub). So we test that the
+:: interpreter actually runs before trusting it, then fall back gracefully.
+set "PYTHON_EXE="
+
 if exist ".venv\Scripts\python.exe" (
-    set "PYTHON_EXE=.venv\Scripts\python.exe"
-    echo [*] Using virtual environment: .venv
-) else (
-    set "PYTHON_EXE=python"
-    echo [!] .venv not detected. Using system Python.
+    ".venv\Scripts\python.exe" --version >nul 2>&1 && (
+        set "PYTHON_EXE=.venv\Scripts\python.exe"
+        echo [*] Using virtual environment: .venv
+    ) || (
+        echo [!] .venv is present but broken - its base Python was moved or uninstalled.
+        echo [!] Recreate it with:  py -3 -m venv .venv ^&^& .venv\Scripts\python -m pip install -r requirements.txt
+        echo [*] Falling back to system Python for now...
+    )
 )
+
+if not defined PYTHON_EXE (
+    py -3 --version >nul 2>&1 && (
+        for /f "delims=" %%p in ('py -3 -c "import sys;print(sys.executable)"') do set "PYTHON_EXE=%%p"
+        echo [*] Using system Python via the py launcher.
+    )
+)
+
+if not defined PYTHON_EXE (
+    python --version >nul 2>&1 && (
+        set "PYTHON_EXE=python"
+        echo [*] Using 'python' from PATH.
+    )
+)
+
+if not defined PYTHON_EXE (
+    echo [!] No working Python interpreter was found on this system.
+    echo [*] Install Python 3.10+ from https://www.python.org/downloads/ and re-run this script.
+    echo.
+    pause
+    exit /b 1
+)
+echo.
 
 :: Parse mode from argument (default: web)
 set "MODE=web"
